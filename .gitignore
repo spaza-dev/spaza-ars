@@ -1,0 +1,7 @@
+/target
+/config.toml
+/.env
+*.db
+*.db-shm
+*.db-wal
+/work/

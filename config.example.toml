@@ -1,0 +1,45 @@
+[server]
+bind = "127.0.0.1:8080"
+public_base_url = "https://olaf.example.com"
+api_token = "change-me"
+health_public = true
+
+[olaf]
+rest_url = "http://127.0.0.1:8920"
+db_path = "/var/lib/ars/olaf-db"
+store_concurrency = 1
+query_concurrency = 4
+timeout_seconds = 120
+
+[capture]
+ffmpeg = "ffmpeg"
+yt_dlp = "yt-dlp"
+temp_dir = "/var/lib/ars/work"
+max_streams = 50
+chunk_seconds = 10
+overlap_seconds = 2
+restart_backoff_seconds = 5
+
+[query]
+min_confidence = 0.5
+min_match_count = 20
+aggregation_window_seconds = 60
+dedupe_window_seconds = 30
+
+[evidence]
+enabled = false
+endpoint = ""
+region = "auto"
+bucket = ""
+access_key = ""
+secret_key = ""
+prefix = "evidence"
+path_style = true
+pre_seconds = 10
+post_seconds = 20
+content_type = "audio/mpeg"
+
+[webhook]
+timeout_seconds = 15
+max_attempts = 10
+signing_secret = ""

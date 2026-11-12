@@ -1,0 +1,20 @@
+[Unit]
+Description=Olaf REST sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ars
+Group=ars
+Environment=HOME=/var/lib/ars
+ExecStart=/usr/local/bin/olaf rest serve --listen 127.0.0.1:8920
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ars
+
+[Install]
+WantedBy=multi-user.target

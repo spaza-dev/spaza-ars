@@ -1,0 +1,35 @@
+# Airplay Recognition Service (ARS) Task List
+
+- [x] Rust project skeleton
+- [x] Config loader and env overrides
+- [x] SQLite schema and migrations
+- [x] Bearer auth
+- [x] Stream CRUD API
+- [x] Callback CRUD API
+- [x] Catalog item API
+- [x] Job API
+- [x] Detection and aggregate APIs
+- [x] Olaf REST engine adapter
+- [x] Query worker
+- [x] Index worker
+- [x] Stream supervisor
+- [x] ffmpeg capture
+- [x] yt-dlp source resolution
+- [x] Detection aggregation
+- [x] Webhook outbox
+- [x] Bearer and HMAC callback auth
+- [x] Evidence S3 upload
+- [x] Per-stream aggregation window
+- [x] Max stream limit
+- [x] 24-hour aggregate cleanup
+- [x] systemd units
+- [x] Installer script
+- [x] Updater script
+- [x] Swagger UI
+- [x] JSON indexing endpoint in addition to multipart
+- [ ] Olaf fingerprint deletion support
+- [ ] Evidence clip trimming with pre/post offsets
+- [ ] Full OpenAPI path documentation
+- [ ] Integration tests with fake Olaf and S3
+- [x] Console provider adapter integration
+- [x] Stream catalogs field in console

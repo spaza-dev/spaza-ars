@@ -1,0 +1,21 @@
+[Unit]
+Description=Airplay Recognition Service (ARS) API and stream monitor
+After=network-online.target olaf-rest.service
+Wants=network-online.target
+Requires=olaf-rest.service
+
+[Service]
+Type=simple
+User=ars
+Group=ars
+EnvironmentFile=/etc/ars/ars.env
+ExecStart=/opt/ars/ars --config /etc/ars/config.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ars /var/log/ars
+
+[Install]
+WantedBy=multi-user.target
