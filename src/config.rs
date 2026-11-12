@@ -104,7 +104,7 @@ impl Default for OlafConfig {
     fn default() -> Self {
         Self {
             rest_url: "http://127.0.0.1:8920".into(),
-            db_path: "/var/lib/ars/olaf-db".into(),
+            db_path: "/var/lib/ars".into(),
             store_concurrency: 1,
             query_concurrency: 4,
             timeout_seconds: 120,
@@ -191,7 +191,7 @@ impl Config {
             .unwrap_or(config.server.health_public);
 
         config.olaf.rest_url = env_or("OLAF_REST_URL", config.olaf.rest_url);
-        config.olaf.db_path = env_or("OLAF_DB_PATH", config.olaf.db_path);
+        config.olaf.db_path = env_or("ARS_DB_PATH", config.olaf.db_path);
         config.olaf.query_concurrency = env::var("ARS_QUERY_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse().ok())

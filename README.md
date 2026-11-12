@@ -33,7 +33,8 @@ olaf rest serve --listen 127.0.0.1:8920
 sudo bash scripts/install.sh
 ```
 
-The installer creates `/opt/ars`, `/etc/ars` and
+The installer installs ffmpeg, yt-dlp, Rust, Zig (when Olaf needs to be built),
+and Olaf if missing. It creates `/opt/ars`, `/etc/ars` and
 `/var/lib/ars`, installs `olaf-rest.service` and
 `ars.service`, and generates the API token.
 

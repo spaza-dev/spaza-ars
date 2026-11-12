@@ -9,12 +9,18 @@ fi
 APP_DIR="/opt/ars"
 STATE_DIR="/var/lib/ars"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="${HOME}/.cargo/bin:${PATH}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="/var/backups/ars/${STAMP}"
 
 mkdir -p "${BACKUP_DIR}"
 cp -a "${APP_DIR}/ars" "${BACKUP_DIR}/ars" 2>/dev/null || true
 cp -a "${STATE_DIR}/ars.db" "${BACKUP_DIR}/ars.db" 2>/dev/null || true
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is required to build ARS. Run scripts/install.sh first." >&2
+  exit 1
+fi
 
 echo "Building new release..."
 (cd "${SOURCE_DIR}" && cargo build --release)
@@ -26,8 +32,13 @@ mv "${APP_DIR}/ars.new" "${APP_DIR}/ars"
 systemctl start olaf-rest.service
 systemctl start ars.service
 
-sleep 3
-if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+for _ in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
   echo "Update succeeded."
   exit 0
 fi

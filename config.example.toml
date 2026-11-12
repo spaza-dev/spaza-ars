@@ -6,7 +6,7 @@ health_public = true
 
 [olaf]
 rest_url = "http://127.0.0.1:8920"
-db_path = "/var/lib/ars/olaf-db"
+db_path = "/var/lib/ars"
 store_concurrency = 1
 query_concurrency = 4
 timeout_seconds = 120
