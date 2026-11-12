@@ -61,6 +61,34 @@ sudo bash scripts/update.sh
 
 All `/v1/*` endpoints require `Authorization: Bearer <ARS_API_TOKEN>`.
 
+
+
+## API documentation
+
+- Swagger UI: `https://airplay-ars.spaza.co.ke/docs`
+- OpenAPI JSON: `https://airplay-ars.spaza.co.ke/openapi.json`
+
+The OpenAPI document is generated from the route annotations and uses
+`ARS_PUBLIC_BASE_URL` / `server.public_base_url` as its server URL.
+
+All `/v1/*` routes use bearer authentication. Click **Authorize** in Swagger
+UI and paste the ARS API token.
+
+## Console integration
+
+Console environment:
+
+```env
+RECOGNITION_PROVIDER=olaf
+OLAF_API_BASE=https://airplay-ars.spaza.co.ke
+OLAF_API_TOKEN=<ARS_API_TOKEN>
+OLAF_CALLBACK_TOKEN=<random callback bearer token>
+OLAF_WEBHOOK_SIGNING_SECRET=<ARS_WEBHOOK_SIGNING_SECRET>
+```
+
+After deploying the console, open **Settings → General → Sync callback URL**
+so ARS registers the console callback URL and callback credentials.
+
 ## Stream fields
 
 Streams support `catalogs` as a JSON array, `evidence_enabled`, per-stream

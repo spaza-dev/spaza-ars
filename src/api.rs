@@ -10,8 +10,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::Server;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{Config as SwaggerConfig, SwaggerUi};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,10 +23,79 @@ pub struct AppState {
 }
 
 #[derive(OpenApi)]
-#[openapi(info(title = "Airplay Recognition Service (ARS)", version = "0.1.0"))]
+#[openapi(
+    info(
+        title = "Airplay Recognition Service (ARS)",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "Stream monitoring, Olaf catalog indexing, detection aggregation, evidence and authenticated webhooks."
+    ),
+    tags(
+        (name = "Health", description = "Liveness and readiness"),
+        (name = "Streams", description = "Stream lifecycle and capture control"),
+        (name = "Callbacks", description = "Webhook callback configuration"),
+        (name = "Catalog", description = "Catalog indexing"),
+        (name = "Query", description = "Ad hoc audio query"),
+        (name = "Jobs", description = "Async job status"),
+        (name = "Detections", description = "Detections and aggregates"),
+        (name = "Webhooks", description = "Webhook testing")
+    ),
+    components(schemas(
+        Stream, CreateStream, UpdateStream,
+        Callback, CreateCallback, UpdateCallback,
+        CatalogItem, IndexItemJson, IndexItemMultipart,
+        Detection, DetectionAggregate,
+        QueryRequest, QueryResponse,
+        JobAccepted, JobStatus,
+        Health, ReadyResponse, VersionResponse,
+        ErrorResponse, DeleteResponse, StatusResponse,
+        TestWebhookRequest, TestWebhookResponse, TestWebhookData,
+        StreamResponse, StreamListResponse,
+        CallbackResponse, CallbackListResponse,
+        CatalogItemResponse, CatalogItemListResponse,
+        DetectionListResponse, AggregateListResponse,
+        JobAcceptedResponse, JobStatusResponse
+    )),
+    paths(
+        health, ready, version,
+        list_streams, create_stream, get_stream, update_stream, delete_stream,
+        start_stream, stop_stream,
+        list_callbacks, create_callback, get_callback, update_callback, delete_callback,
+        list_catalog_items, get_catalog_item, index_catalog_item,
+        index_catalog_item_json, delete_catalog_item,
+        query_audio, get_job, list_detections, list_aggregates, test_webhook
+    )
+)]
 struct ApiDoc;
 
+pub fn build_openapi(config: &Config) -> utoipa::openapi::OpenApi {
+    let mut openapi = ApiDoc::openapi();
+    openapi.servers = Some(vec![Server::new(config.server.public_base_url.clone())]);
+    if let Some(components) = openapi.components.as_mut() {
+        components.security_schemes.insert(
+            "bearer_auth".into(),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("opaque")
+                    .build(),
+            ),
+        );
+    }
+    openapi
+}
+
 pub fn router(state: AppState) -> Router {
+    let openapi = build_openapi(&state.config);
+    let swagger = SwaggerUi::new("/docs")
+        .url("/openapi.json", openapi)
+        .config(
+            SwaggerConfig::default()
+                .persist_authorization(true)
+                .try_it_out_enabled(true)
+                .display_request_duration(true)
+                .filter(true),
+        );
+
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -57,7 +128,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/detections", get(list_detections))
         .route("/v1/detections/aggregate", get(list_aggregates))
         .route("/v1/webhooks/test", post(test_webhook))
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .merge(swagger)
         .with_state(state)
 }
 
@@ -75,6 +146,12 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Health",
+    responses((status = 200, description = "Service health", body = Health))
+)]
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let (streams, jobs, webhooks) = db::counts(&state.db).unwrap_or((0, 0, 0));
     Json(Health {
@@ -87,6 +164,15 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Readiness status", body = ReadyResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse)
+    )
+)]
 async fn ready(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -107,6 +193,12 @@ async fn ready(
     })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "Health",
+    responses((status = 200, description = "Version information", body = VersionResponse))
+)]
 async fn version() -> impl IntoResponse {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -114,6 +206,17 @@ async fn version() -> impl IntoResponse {
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/streams",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Streams returned", body = StreamListResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn list_streams(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -124,6 +227,34 @@ async fn list_streams(
     Ok(Json(ApiResponse::ok(streams)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/streams",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = CreateStream,
+        description = "Create a monitored stream.",
+        example = json!({
+            "name": "Radio One",
+            "url": "https://example.com/live.mp3",
+            "source_type": "radio",
+            "external_id": "12345",
+            "catalogs": ["private"],
+            "enabled": true,
+            "evidence_enabled": false,
+            "chunk_seconds": 10,
+            "overlap_seconds": 2,
+            "aggregation_window_seconds": 60
+        })
+    ),
+    responses(
+        (status = 201, description = "Stream created", body = StreamResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn create_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -135,6 +266,18 @@ async fn create_stream(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(stream))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/streams/{id}",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Stream returned", body = StreamResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse)
+    )
+)]
 async fn get_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -149,6 +292,29 @@ async fn get_stream(
     }
 }
 
+#[utoipa::path(
+    patch,
+    path = "/v1/streams/{id}",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Stream ID", example = "str_123")),
+    request_body(
+        content = UpdateStream,
+        description = "Update stream fields. Only provided fields are changed.",
+        example = json!({
+            "url": "https://example.com/new-stream.mp3",
+            "catalogs": ["private"],
+            "enabled": true,
+            "aggregation_window_seconds": 30
+        })
+    ),
+    responses(
+        (status = 200, description = "Stream updated", body = StreamResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse)
+    )
+)]
 async fn update_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -164,6 +330,18 @@ async fn update_stream(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/streams/{id}",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Stream deleted", body = DeleteResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse)
+    )
+)]
 async fn delete_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -179,6 +357,17 @@ async fn delete_stream(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/streams/{id}/start",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Stream starting", body = StatusResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn start_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -190,6 +379,17 @@ async fn start_stream(
     Ok(Json(ApiResponse::ok(json!({ "status": "starting" }))))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/streams/{id}/stop",
+    tag = "Streams",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Stream stopped", body = StatusResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn stop_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -216,6 +416,16 @@ async fn stop_stream(
     Ok(Json(ApiResponse::ok(json!({ "status": "stopped" }))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/callbacks",
+    tag = "Callbacks",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Callbacks returned", body = CallbackListResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn list_callbacks(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -226,6 +436,30 @@ async fn list_callbacks(
     Ok(Json(ApiResponse::ok(callbacks)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/callbacks",
+    tag = "Callbacks",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = CreateCallback,
+        description = "Register an authenticated webhook callback.",
+        example = json!({
+            "name": "console-default",
+            "url": "https://console.example.com/api/callback/secret",
+            "auth_type": "both",
+            "token": "callback-bearer-token",
+            "signing_secret": "callback-hmac-secret",
+            "event_types": ["matches.aggregated", "stream.status"],
+            "enabled": true
+        })
+    ),
+    responses(
+        (status = 201, description = "Callback created", body = CallbackResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn create_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -237,6 +471,18 @@ async fn create_callback(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(callback))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/callbacks/{id}",
+    tag = "Callbacks",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Callback ID", example = "cb_123")),
+    responses(
+        (status = 200, description = "Callback returned", body = CallbackResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Callback not found", body = ErrorResponse)
+    )
+)]
 async fn get_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -251,6 +497,27 @@ async fn get_callback(
     }
 }
 
+#[utoipa::path(
+    patch,
+    path = "/v1/callbacks/{id}",
+    tag = "Callbacks",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Callback ID", example = "cb_123")),
+    request_body(
+        content = UpdateCallback,
+        description = "Update callback fields. Only provided fields are changed.",
+        example = json!({
+            "url": "https://console.example.com/api/callback/new-secret",
+            "enabled": true
+        })
+    ),
+    responses(
+        (status = 200, description = "Callback updated", body = CallbackResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Callback not found", body = ErrorResponse)
+    )
+)]
 async fn update_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,6 +533,18 @@ async fn update_callback(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/callbacks/{id}",
+    tag = "Callbacks",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Callback ID", example = "cb_123")),
+    responses(
+        (status = 200, description = "Callback deleted", body = DeleteResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Callback not found", body = ErrorResponse)
+    )
+)]
 async fn delete_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -286,6 +565,18 @@ struct CatalogQuery {
     catalog: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/catalog/items",
+    tag = "Catalog",
+    security(("bearer_auth" = [])),
+    params(("catalog" = Option<String>, Query, description = "Filter by catalog", example = "private")),
+    responses(
+        (status = 200, description = "Catalog items returned", body = CatalogItemListResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn list_catalog_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -297,6 +588,18 @@ async fn list_catalog_items(
     Ok(Json(ApiResponse::ok(items)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/catalog/items/{id}",
+    tag = "Catalog",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Catalog item ID", example = "cat_123")),
+    responses(
+        (status = 200, description = "Catalog item returned", body = CatalogItemResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Catalog item not found", body = ErrorResponse)
+    )
+)]
 async fn get_catalog_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -311,6 +614,31 @@ async fn get_catalog_item(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/catalog/items",
+    tag = "Catalog",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = IndexItemMultipart,
+        content_type = "multipart/form-data",
+        description = "Provide either a file or a URL, plus name and optional catalog metadata.",
+        example = json!({
+            "name": "Song A",
+            "catalog": "private",
+            "external_id": "12345",
+            "type": "song",
+            "metadata": "{\"artist\":\"Artist A\",\"album\":\"Album A\"}",
+            "url": "https://example.com/song.mp3"
+        })
+    ),
+    responses(
+        (status = 202, description = "Indexing accepted", body = JobAcceptedResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn index_catalog_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -406,6 +734,30 @@ async fn index_catalog_item(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/catalog/items/json",
+    tag = "Catalog",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = IndexItemJson,
+        description = "Index an audio item from a URL.",
+        example = json!({
+            "catalog": "private",
+            "external_id": "12345",
+            "name": "Song A",
+            "type": "song",
+            "metadata": {"artist": "Artist A", "album": "Album A"},
+            "url": "https://example.com/song.mp3"
+        })
+    ),
+    responses(
+        (status = 202, description = "Indexing accepted", body = JobAcceptedResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    )
+)]
 async fn index_catalog_item_json(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -442,6 +794,18 @@ async fn index_catalog_item_json(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/catalog/items/{id}",
+    tag = "Catalog",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Catalog item ID", example = "cat_123")),
+    responses(
+        (status = 200, description = "Catalog item deleted locally", body = DeleteResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Catalog item not found", body = ErrorResponse)
+    )
+)]
 async fn delete_catalog_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -460,6 +824,27 @@ async fn delete_catalog_item(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/query",
+    tag = "Query",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = QueryRequest,
+        description = "Query a URL or audio URL against the Olaf catalog.",
+        example = json!({
+            "url": "https://example.com/fragment.mp3",
+            "catalog": ["private"],
+            "options": {"minimum_confidence": 0.5}
+        })
+    ),
+    responses(
+        (status = 200, description = "Query matches", body = QueryResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 502, description = "Olaf query failed", body = ErrorResponse)
+    )
+)]
 async fn query_audio(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -492,6 +877,18 @@ async fn query_audio(
     Ok(Json(ApiResponse::ok(json!({ "matches": matches }))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/jobs/{id}",
+    tag = "Jobs",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Job ID", example = "job_123")),
+    responses(
+        (status = 200, description = "Job status returned", body = JobStatusResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse)
+    )
+)]
 async fn get_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -511,6 +908,17 @@ struct DetectionQuery {
     stream_id: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/detections",
+    tag = "Detections",
+    security(("bearer_auth" = [])),
+    params(("stream_id" = Option<String>, Query, description = "Filter by stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Detections returned", body = DetectionListResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn list_detections(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -522,17 +930,44 @@ async fn list_detections(
     Ok(Json(ApiResponse::ok(detections)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/detections/aggregate",
+    tag = "Detections",
+    security(("bearer_auth" = [])),
+    params(("stream_id" = Option<String>, Query, description = "Filter by stream ID", example = "str_123")),
+    responses(
+        (status = 200, description = "Detection aggregates returned", body = AggregateListResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn list_aggregates(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CatalogQuery>,
+    Query(query): Query<DetectionQuery>,
 ) -> Result<Json<ApiResponse<Vec<DetectionAggregate>>>, ApiError> {
     authorize(&state, &headers)?;
-    let aggregates = db::list_aggregates(&state.db, query.catalog.as_deref())
+    let aggregates = db::list_aggregates(&state.db, query.stream_id.as_deref())
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(ApiResponse::ok(aggregates)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/webhooks/test",
+    tag = "Webhooks",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = TestWebhookRequest,
+        description = "Queue a test webhook for a callback.",
+        example = json!({"callback_id": "cb_123"})
+    ),
+    responses(
+        (status = 200, description = "Test webhook queued", body = TestWebhookResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token", body = ErrorResponse)
+    )
+)]
 async fn test_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -557,4 +992,37 @@ async fn test_webhook(
     )
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(ApiResponse::ok(json!({ "queued": true }))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_documents_routes_security_and_examples() {
+        let doc = build_openapi(&Config::default());
+        let value = serde_json::to_value(&doc).expect("openapi serializes");
+
+        assert_eq!(
+            value["servers"][0]["url"],
+            "https://airplay-ars.spaza.co.ke"
+        );
+        assert_eq!(
+            value["components"]["securitySchemes"]["bearer_auth"]["scheme"],
+            "bearer"
+        );
+        assert!(value["paths"]["/v1/streams"]["post"].is_object());
+        assert!(value["paths"]["/v1/callbacks"]["post"].is_object());
+        assert!(value["paths"]["/v1/catalog/items"]["post"].is_object());
+        assert!(
+            value["paths"]["/v1/streams"]["post"]["requestBody"]["content"]["application/json"]
+                ["example"]
+                .is_object()
+        );
+        assert!(
+            value["paths"]["/v1/catalog/items"]["post"]["requestBody"]["content"]
+                ["multipart/form-data"]["example"]
+                .is_object()
+        );
+    }
 }

@@ -93,7 +93,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".into(),
-            public_base_url: "https://olaf.example.com".into(),
+            public_base_url: "https://airplay-ars.spaza.co.ke".into(),
             api_token: "change-me".into(),
             health_public: true,
         }
