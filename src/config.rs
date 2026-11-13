@@ -16,6 +16,8 @@ pub struct Config {
     pub evidence: EvidenceConfig,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +78,13 @@ pub struct WebhookConfig {
     pub signing_secret: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexConfig {
+    pub download_timeout_seconds: u64,
+    pub max_download_bytes: u64,
+    pub max_upload_bytes: u64,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -85,6 +94,7 @@ impl Default for Config {
             query: QueryConfig::default(),
             evidence: EvidenceConfig::default(),
             webhook: WebhookConfig::default(),
+            index: IndexConfig::default(),
         }
     }
 }
@@ -161,6 +171,16 @@ impl Default for WebhookConfig {
             timeout_seconds: 15,
             max_attempts: 10,
             signing_secret: "".into(),
+        }
+    }
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            download_timeout_seconds: 120,
+            max_download_bytes: 100 * 1024 * 1024,
+            max_upload_bytes: 100 * 1024 * 1024,
         }
     }
 }
@@ -245,6 +265,19 @@ impl Config {
 
         config.webhook.signing_secret =
             env_or("ARS_WEBHOOK_SIGNING_SECRET", config.webhook.signing_secret);
+
+        config.index.download_timeout_seconds = env::var("ARS_INDEX_DOWNLOAD_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(config.index.download_timeout_seconds);
+        config.index.max_download_bytes = env::var("ARS_INDEX_MAX_DOWNLOAD_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(config.index.max_download_bytes);
+        config.index.max_upload_bytes = env::var("ARS_INDEX_MAX_UPLOAD_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(config.index.max_upload_bytes);
 
         Ok(config)
     }

@@ -28,6 +28,12 @@ impl WebhookSender {
     pub async fn process_outbox(&self, db: &Db) -> Result<()> {
         let items = db::due_webhooks(db, 20)?;
         for (id, callback, event_type, payload, _attempts) in items {
+            let subscribed: Vec<String> =
+                serde_json::from_str(&callback.event_types).unwrap_or_default();
+            if !subscribed.is_empty() && !subscribed.iter().any(|value| value == &event_type) {
+                db::mark_webhook_sent(db, &id)?;
+                continue;
+            }
             let body = payload.clone();
             let mut request = self
                 .client

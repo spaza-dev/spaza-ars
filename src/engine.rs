@@ -29,12 +29,15 @@ impl OlafEngine {
         }
     }
 
-    pub async fn store(&self, identifier: &str, bytes: Vec<u8>) -> Result<Value> {
-        let url = format!(
+    pub async fn store(&self, identifier: &str, bytes: Vec<u8>, force: bool) -> Result<Value> {
+        let mut url = format!(
             "{}/api/store?identifier={}",
             self.base_url,
             urlencoding(identifier)
         );
+        if force {
+            url.push_str("&force=true");
+        }
         let response = self
             .client
             .post(url)

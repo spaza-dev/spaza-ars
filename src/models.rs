@@ -118,8 +118,14 @@ pub struct IndexItemJson {
     #[schema(example = "song")]
     pub item_type: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    #[schema(example = "https://example.com/song.mp3")]
+    #[schema(example = "https://...presigned-r2-get...")]
     pub url: String,
+    #[schema(example = "2026-11-13T10:15:00Z")]
+    pub url_expires_at: Option<String>,
+    #[schema(example = "cb_123")]
+    pub callback_id: Option<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -135,6 +141,7 @@ pub struct CatalogItem {
     pub status: String,
     pub indexed_at: Option<String>,
     pub error: Option<String>,
+    pub last_job_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -261,8 +268,10 @@ pub struct TestWebhookRequest {
 pub struct IndexItemMultipart {
     #[schema(format = Binary, value_type = String)]
     pub file: Option<String>,
-    #[schema(example = "https://example.com/song.mp3")]
+    #[schema(example = "https://...presigned-r2-get...")]
     pub url: Option<String>,
+    #[schema(example = "2026-11-13T10:15:00Z")]
+    pub url_expires_at: Option<String>,
     #[schema(example = "Song A")]
     pub name: String,
     #[schema(example = "private")]
@@ -273,6 +282,10 @@ pub struct IndexItemMultipart {
     pub r#type: Option<String>,
     #[schema(example = "{\"artist\":\"Artist A\"}")]
     pub metadata: Option<String>,
+    #[schema(example = "cb_123")]
+    pub callback_id: Option<String>,
+    #[schema(example = "false")]
+    pub force: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -340,4 +353,14 @@ pub struct TestWebhookData {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TestWebhookResponse {
     pub data: TestWebhookData,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CatalogIndexResponse {
+    pub catalog_item_id: String,
+    pub job_id: Option<String>,
+    pub status: String,
+    pub already_indexed: bool,
+    pub indexed_at: Option<String>,
+    pub status_url: Option<String>,
 }

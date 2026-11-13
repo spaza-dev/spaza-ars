@@ -89,6 +89,23 @@ OLAF_WEBHOOK_SIGNING_SECRET=<ARS_WEBHOOK_SIGNING_SECRET>
 After deploying the console, open **Settings → General → Sync callback URL**
 so ARS registers the console callback URL and callback credentials.
 
+## Catalog indexing
+
+`POST /v1/catalog/items/json` accepts a presigned HTTPS GET URL and is
+idempotent on `catalog + external_id`:
+
+- `200` when the item is already indexed and `force` is false.
+- `202` when an index job is queued or already running.
+- `force=true` re-indexes an existing item.
+
+Index jobs download the URL to a temporary file, enforce HTTPS, a timeout and
+a maximum size, then forward the audio to Olaf `/api/store`. Temporary files
+are removed after success or failure. Index jobs are single-attempt; the
+console generates a fresh presigned URL when resubmitting.
+
+The same idempotency rules apply to the multipart `POST /v1/catalog/items`
+endpoint.
+
 ## Stream fields
 
 Streams support `catalogs` as a JSON array, `evidence_enabled`, per-stream

@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::openapi::Server;
 use utoipa::OpenApi;
@@ -53,7 +54,7 @@ pub struct AppState {
         CallbackResponse, CallbackListResponse,
         CatalogItemResponse, CatalogItemListResponse,
         DetectionListResponse, AggregateListResponse,
-        JobAcceptedResponse, JobStatusResponse
+        JobAcceptedResponse, JobStatusResponse, CatalogIndexResponse
     )),
     paths(
         health, ready, version,
@@ -614,6 +615,250 @@ async fn get_catalog_item(
     }
 }
 
+enum IndexSource {
+    Url(String),
+    File,
+}
+
+struct IndexRequest {
+    catalog: String,
+    external_id: Option<String>,
+    name: String,
+    item_type: String,
+    metadata: Value,
+    source: IndexSource,
+    force: bool,
+    callback_id: Option<String>,
+    url_expires_at: Option<String>,
+}
+
+fn validate_index_url(url: &str, expires_at: Option<&str>) -> Result<(), ApiError> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| err(StatusCode::BAD_REQUEST, "url is invalid"))?;
+    if parsed.scheme() != "https" {
+        return Err(err(StatusCode::BAD_REQUEST, "url must use https"));
+    }
+    if let Some(expires_at) = expires_at {
+        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "url_expires_at must be RFC3339"))?;
+        if expires.timestamp() < chrono::Utc::now().timestamp() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "url_expires_at is in the past",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn existing_response(
+    state: &AppState,
+    existing: &CatalogItem,
+    force: bool,
+) -> Option<(StatusCode, Json<ApiResponse<CatalogIndexResponse>>)> {
+    if existing.status == "indexed" && !force {
+        return Some((
+            StatusCode::OK,
+            Json(ApiResponse::ok(CatalogIndexResponse {
+                catalog_item_id: existing.id.clone(),
+                job_id: existing.last_job_id.clone(),
+                status: existing.status.clone(),
+                already_indexed: true,
+                indexed_at: existing.indexed_at.clone(),
+                status_url: None,
+            })),
+        ));
+    }
+    if matches!(existing.status.as_str(), "pending" | "indexing") {
+        if let Some(job_id) = existing.last_job_id.clone() {
+            let status_url = format!("{}/v1/jobs/{}", state.config.server.public_base_url, job_id);
+            return Some((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::ok(CatalogIndexResponse {
+                    catalog_item_id: existing.id.clone(),
+                    job_id: Some(job_id),
+                    status: existing.status.clone(),
+                    already_indexed: false,
+                    indexed_at: existing.indexed_at.clone(),
+                    status_url: Some(status_url),
+                })),
+            ));
+        }
+    }
+    None
+}
+
+fn enqueue_for_item(
+    state: &AppState,
+    item: &CatalogItem,
+    source: IndexSource,
+    temp_path: &mut Option<String>,
+    force: bool,
+    callback_id: Option<String>,
+) -> Result<(StatusCode, Json<ApiResponse<CatalogIndexResponse>>), ApiError> {
+    let payload = match source {
+        IndexSource::File => {
+            let path = temp_path
+                .take()
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "provide a file or url"))?;
+            json!({
+                "catalog_item_id": item.id,
+                "path": path,
+                "callback_id": callback_id,
+                "force": force,
+            })
+        }
+        IndexSource::Url(url) => json!({
+            "catalog_item_id": item.id,
+            "url": url,
+            "callback_id": callback_id,
+            "force": force,
+        }),
+    };
+    let job_id = db::enqueue_job(&state.db, "index", &payload, 0)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    db::set_catalog_item_job(&state.db, &item.id, &job_id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let status_url = format!("{}/v1/jobs/{}", state.config.server.public_base_url, job_id);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(CatalogIndexResponse {
+            catalog_item_id: item.id.clone(),
+            job_id: Some(job_id),
+            status: "accepted".into(),
+            already_indexed: false,
+            indexed_at: None,
+            status_url: Some(status_url),
+        })),
+    ))
+}
+
+fn queue_index(
+    state: &AppState,
+    request: IndexRequest,
+    temp_path: &mut Option<String>,
+) -> Result<(StatusCode, Json<ApiResponse<CatalogIndexResponse>>), ApiError> {
+    if request.name.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name is required"));
+    }
+    match &request.source {
+        IndexSource::Url(url) => validate_index_url(url, request.url_expires_at.as_deref())?,
+        IndexSource::File => {
+            if temp_path.is_none() {
+                return Err(err(StatusCode::BAD_REQUEST, "provide a file or url"));
+            }
+        }
+    }
+
+    let mut item: Option<CatalogItem> = None;
+    if let Some(external_id) = request.external_id.as_deref() {
+        if let Some(existing) =
+            db::find_catalog_item_by_catalog_external(&state.db, &request.catalog, external_id)
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        {
+            if let Some(response) = existing_response(state, &existing, request.force) {
+                return Ok(response);
+            }
+            item = Some(existing);
+        }
+    }
+
+    let item = match item {
+        Some(item) => item,
+        None => {
+            let fingerprint_id = format!("cat_{}", uuid::Uuid::new_v4().simple());
+            match db::create_catalog_item(
+                &state.db,
+                &request.catalog,
+                request.external_id.as_deref(),
+                &request.name,
+                &request.item_type,
+                &request.metadata,
+                &fingerprint_id,
+            ) {
+                Ok(item) => item,
+                Err(error) => {
+                    if let Some(external_id) = request.external_id.as_deref() {
+                        if let Some(existing) = db::find_catalog_item_by_catalog_external(
+                            &state.db,
+                            &request.catalog,
+                            external_id,
+                        )
+                        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                        {
+                            if let Some(response) =
+                                existing_response(state, &existing, request.force)
+                            {
+                                return Ok(response);
+                            }
+                            existing
+                        } else {
+                            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+                        }
+                    } else {
+                        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+                    }
+                }
+            }
+        }
+    };
+
+    enqueue_for_item(
+        state,
+        &item,
+        request.source,
+        temp_path,
+        request.force,
+        request.callback_id,
+    )
+}
+
+async fn write_multipart_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    dir: &str,
+    max_bytes: u64,
+) -> Result<String, ApiError> {
+    let path = format!("{}/upload-{}.bin", dir, uuid::Uuid::new_v4().simple());
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut total = 0_u64;
+    loop {
+        let chunk = match field.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(err(StatusCode::BAD_REQUEST, error.to_string()));
+            }
+        };
+        total += chunk.len() as u64;
+        if total > max_bytes {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file exceeds upload limit",
+            ));
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+        }
+    }
+    if let Err(error) = file.flush().await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+    }
+    if total == 0 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(err(StatusCode::BAD_REQUEST, "file is empty"));
+    }
+    Ok(path)
+}
+
 #[utoipa::path(
     post,
     path = "/v1/catalog/items",
@@ -622,20 +867,25 @@ async fn get_catalog_item(
     request_body(
         content = IndexItemMultipart,
         content_type = "multipart/form-data",
-        description = "Provide either a file or a URL, plus name and optional catalog metadata.",
+        description = "Index an audio item from a file or a presigned HTTPS URL. Idempotent on catalog + external_id.",
         example = json!({
             "name": "Song A",
             "catalog": "private",
             "external_id": "12345",
             "type": "song",
             "metadata": "{\"artist\":\"Artist A\",\"album\":\"Album A\"}",
-            "url": "https://example.com/song.mp3"
+            "url": "https://...presigned-r2-get...",
+            "url_expires_at": "2026-11-13T10:15:00Z",
+            "callback_id": "cb_123",
+            "force": "false"
         })
     ),
     responses(
-        (status = 202, description = "Indexing accepted", body = JobAcceptedResponse),
+        (status = 200, description = "Already indexed", body = CatalogIndexResponse),
+        (status = 202, description = "Indexing accepted", body = CatalogIndexResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Invalid bearer token", body = ErrorResponse),
+        (status = 413, description = "File exceeds upload limit", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     )
 )]
@@ -643,15 +893,23 @@ async fn index_catalog_item(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<ApiResponse<JobAccepted>>), ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<CatalogIndexResponse>>), ApiError> {
     authorize(&state, &headers)?;
+    let dir = format!("{}/index", state.config.capture.temp_dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let mut catalog = "private".to_string();
     let mut external_id: Option<String> = None;
     let mut name = String::new();
     let mut item_type = "song".to_string();
     let mut metadata = json!({});
-    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut temp_path: Option<String> = None;
     let mut url: Option<String> = None;
+    let mut url_expires_at: Option<String> = None;
+    let mut callback_id: Option<String> = None;
+    let mut force = false;
 
     while let Some(field) = multipart
         .next_field()
@@ -661,13 +919,21 @@ async fn index_catalog_item(
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "file" => {
-                file_bytes = Some(
-                    field
-                        .bytes()
+                let path =
+                    match write_multipart_file(field, &dir, state.config.index.max_upload_bytes)
                         .await
-                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-                        .to_vec(),
-                );
+                    {
+                        Ok(path) => path,
+                        Err(error) => {
+                            if let Some(existing) = temp_path.take() {
+                                let _ = tokio::fs::remove_file(existing).await;
+                            }
+                            return Err(error);
+                        }
+                    };
+                if let Some(existing) = temp_path.replace(path) {
+                    let _ = tokio::fs::remove_file(existing).await;
+                }
             }
             "url" => {
                 url = Some(
@@ -676,6 +942,26 @@ async fn index_catalog_item(
                         .await
                         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
                 )
+            }
+            "url_expires_at" => {
+                url_expires_at = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
+                )
+            }
+            "callback_id" => {
+                callback_id = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
+                )
+            }
+            "force" => {
+                let value = field.text().await.unwrap_or_default();
+                force = value == "1" || value.eq_ignore_ascii_case("true");
             }
             "catalog" => catalog = field.text().await.unwrap_or_else(|_| "private".into()),
             "external_id" => external_id = Some(field.text().await.unwrap_or_default()),
@@ -689,49 +975,30 @@ async fn index_catalog_item(
         }
     }
 
-    if name.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "name is required"));
-    }
-    if file_bytes.is_none() && url.is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "provide a file or url"));
-    }
-
-    let fingerprint_id = format!("cat_{}", uuid::Uuid::new_v4().simple());
-    let item = db::create_catalog_item(
-        &state.db,
-        &catalog,
-        external_id.as_deref(),
-        &name,
-        &item_type,
-        &metadata,
-        &fingerprint_id,
-    )
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let payload = if let Some(bytes) = file_bytes {
-        let dir = format!("{}/index", state.config.capture.temp_dir);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let path = format!("{}/{}.bin", dir, item.id);
-        tokio::fs::write(&path, bytes)
-            .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        json!({ "catalog_item_id": item.id, "path": path })
+    let source = if temp_path.is_some() {
+        IndexSource::File
+    } else if let Some(url) = url {
+        IndexSource::Url(url)
     } else {
-        json!({ "catalog_item_id": item.id, "url": url })
+        return Err(err(StatusCode::BAD_REQUEST, "provide a file or url"));
     };
-    let job_id = db::enqueue_job(&state.db, "index", &payload, 0)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let status_url = format!("{}/v1/jobs/{}", state.config.server.public_base_url, job_id);
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(JobAccepted {
-            job_id,
-            status: "accepted".into(),
-            status_url,
-        })),
-    ))
+
+    let request = IndexRequest {
+        catalog,
+        external_id,
+        name,
+        item_type,
+        metadata,
+        source,
+        force,
+        callback_id,
+        url_expires_at,
+    };
+    let outcome = queue_index(&state, request, &mut temp_path);
+    if let Some(path) = temp_path.take() {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    outcome
 }
 
 #[utoipa::path(
@@ -741,18 +1008,22 @@ async fn index_catalog_item(
     security(("bearer_auth" = [])),
     request_body(
         content = IndexItemJson,
-        description = "Index an audio item from a URL.",
+        description = "Index an audio item from a presigned HTTPS URL. Idempotent on catalog + external_id; 200 when already indexed, 202 when queued.",
         example = json!({
             "catalog": "private",
             "external_id": "12345",
             "name": "Song A",
             "type": "song",
             "metadata": {"artist": "Artist A", "album": "Album A"},
-            "url": "https://example.com/song.mp3"
+            "url": "https://...presigned-r2-get...",
+            "url_expires_at": "2026-11-13T10:15:00Z",
+            "callback_id": "cb_123",
+            "force": false
         })
     ),
     responses(
-        (status = 202, description = "Indexing accepted", body = JobAcceptedResponse),
+        (status = 200, description = "Already indexed", body = CatalogIndexResponse),
+        (status = 202, description = "Indexing accepted", body = CatalogIndexResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Invalid bearer token", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
@@ -762,36 +1033,21 @@ async fn index_catalog_item_json(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<IndexItemJson>,
-) -> Result<(StatusCode, Json<ApiResponse<JobAccepted>>), ApiError> {
+) -> Result<(StatusCode, Json<ApiResponse<CatalogIndexResponse>>), ApiError> {
     authorize(&state, &headers)?;
-    let fingerprint_id = format!("cat_{}", uuid::Uuid::new_v4().simple());
-    let metadata = input.metadata.unwrap_or_else(|| json!({}));
-    let item = db::create_catalog_item(
-        &state.db,
-        input.catalog.as_deref().unwrap_or("private"),
-        input.external_id.as_deref(),
-        &input.name,
-        input.item_type.as_deref().unwrap_or("song"),
-        &metadata,
-        &fingerprint_id,
-    )
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let job_id = db::enqueue_job(
-        &state.db,
-        "index",
-        &json!({ "catalog_item_id": item.id, "url": input.url }),
-        0,
-    )
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let status_url = format!("{}/v1/jobs/{}", state.config.server.public_base_url, job_id);
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(JobAccepted {
-            job_id,
-            status: "accepted".into(),
-            status_url,
-        })),
-    ))
+    let request = IndexRequest {
+        catalog: input.catalog.unwrap_or_else(|| "private".into()),
+        external_id: input.external_id,
+        name: input.name,
+        item_type: input.item_type.unwrap_or_else(|| "song".into()),
+        metadata: input.metadata.unwrap_or_else(|| json!({})),
+        source: IndexSource::Url(input.url),
+        force: input.force,
+        callback_id: input.callback_id,
+        url_expires_at: input.url_expires_at,
+    };
+    let mut temp_path = None;
+    queue_index(&state, request, &mut temp_path)
 }
 
 #[utoipa::path(
@@ -1024,5 +1280,79 @@ mod tests {
                 ["multipart/form-data"]["example"]
                 .is_object()
         );
+        assert!(
+            value["paths"]["/v1/catalog/items/json"]["post"]["requestBody"]["content"]
+                ["application/json"]["example"]["force"]
+                .is_boolean()
+        );
+    }
+
+    #[test]
+    fn index_url_validation_requires_https_and_future_expiry() {
+        assert!(validate_index_url("https://example.com/a.mp3", None).is_ok());
+        assert!(validate_index_url("http://example.com/a.mp3", None).is_err());
+        assert!(validate_index_url("not a url", None).is_err());
+        assert!(
+            validate_index_url("https://example.com/a.mp3", Some("2999-01-01T00:00:00Z")).is_ok()
+        );
+        assert!(
+            validate_index_url("https://example.com/a.mp3", Some("2000-01-01T00:00:00Z")).is_err()
+        );
+        assert!(validate_index_url("https://example.com/a.mp3", Some("nope")).is_err());
+    }
+
+    #[test]
+    fn queue_index_is_idempotent_and_supports_force() {
+        let dir = std::env::temp_dir().join(format!("ars-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = db::open(&format!("{}/ars.db", dir.display())).expect("open db");
+        db::migrate(&db, include_str!("../migrations/0001_init.sql")).expect("migrate");
+        db::apply_migration(
+            &db,
+            2,
+            include_str!("../migrations/0002_catalog_idempotency.sql"),
+        )
+        .expect("migrate 2");
+
+        let config = Config::default();
+        let state = AppState {
+            config: config.clone(),
+            db: db.clone(),
+            engine: OlafEngine::new(&config.olaf).expect("engine"),
+        };
+
+        let request = || IndexRequest {
+            catalog: "private".into(),
+            external_id: Some("idem-test".into()),
+            name: "Idem Song".into(),
+            item_type: "song".into(),
+            metadata: json!({}),
+            source: IndexSource::Url("https://example.com/song.mp3".into()),
+            force: false,
+            callback_id: None,
+            url_expires_at: None,
+        };
+
+        let mut temp_path = None;
+        let (status, body) = queue_index(&state, request(), &mut temp_path).expect("first queue");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body.0.data.already_indexed, false);
+        assert!(body.0.data.job_id.is_some());
+
+        let item = db::find_catalog_item_by_catalog_external(&db, "private", "idem-test")
+            .expect("lookup")
+            .expect("item");
+        db::mark_catalog_item_indexed(&db, &item.id).expect("mark indexed");
+
+        let (status, body) = queue_index(&state, request(), &mut temp_path).expect("second queue");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.0.data.already_indexed);
+
+        let mut forced = request();
+        forced.force = true;
+        let (status, _) = queue_index(&state, forced, &mut temp_path).expect("forced queue");
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

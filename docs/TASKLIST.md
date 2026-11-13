@@ -29,7 +29,12 @@
 - [x] JSON indexing endpoint in addition to multipart
 - [ ] Olaf fingerprint deletion support
 - [ ] Evidence clip trimming with pre/post offsets
-- [ ] Full OpenAPI path documentation
+- [x] Full OpenAPI path documentation
+- [x] Catalog index idempotency by `catalog + external_id`
+- [x] Presigned URL indexing with HTTPS, timeout and size limits
+- [x] `catalog.index.completed` / `catalog.index.failed` webhooks
+- [x] Single-attempt index jobs (console resubmits with a fresh URL)
+- [x] Webhook event-type subscription filtering
 - [ ] Integration tests with fake Olaf and S3
 - [x] Console provider adapter integration
 - [x] Stream catalogs field in console

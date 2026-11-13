@@ -27,6 +27,11 @@ async fn main() -> Result<()> {
 
     let db = db::open(&format!("{}/ars.db", config.olaf.db_path))?;
     db::migrate(&db, include_str!("../migrations/0001_init.sql"))?;
+    db::apply_migration(
+        &db,
+        2,
+        include_str!("../migrations/0002_catalog_idempotency.sql"),
+    )?;
 
     let engine = engine::OlafEngine::new(&config.olaf)?;
     let state = api::AppState {

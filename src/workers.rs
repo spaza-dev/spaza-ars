@@ -4,8 +4,10 @@ use crate::engine::OlafEngine;
 use crate::evidence;
 use crate::webhook::WebhookSender;
 use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::time::{interval, MissedTickBehavior};
 
 pub async fn run_query_worker(config: Config, db: Db, engine: OlafEngine) {
@@ -179,7 +181,57 @@ fn match_identifier(value: &Value) -> Option<String> {
     None
 }
 
+fn enqueue_index_webhook(
+    db: &Db,
+    catalog_item_id: &str,
+    job_id: &str,
+    callback_id: Option<&str>,
+    event: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let callback_id = match callback_id {
+        Some(value) => value.to_string(),
+        None => match db::first_enabled_callback_id(db)? {
+            Some(value) => value,
+            None => return Ok(()),
+        },
+    };
+    let item = match db::get_catalog_item(db, catalog_item_id)? {
+        Some(item) => item,
+        None => return Ok(()),
+    };
+    let payload = serde_json::json!({
+        "event": event,
+        "catalog_item_id": item.id,
+        "catalog": item.catalog,
+        "external_id": item.external_id,
+        "fingerprint_id": item.fingerprint_id,
+        "status": item.status,
+        "indexed_at": item.indexed_at,
+        "job_id": job_id,
+        "error": error,
+    });
+    db::enqueue_webhook(
+        db,
+        &callback_id,
+        event,
+        &payload,
+        &format!("catalog-index:{}:{}", job_id, event),
+    )?;
+    Ok(())
+}
+
 pub async fn run_index_worker(config: Config, db: Db, engine: OlafEngine) {
+    let download_client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.index.download_timeout_seconds))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(%error, "failed to build index download client");
+            return;
+        }
+    };
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -187,10 +239,23 @@ pub async fn run_index_worker(config: Config, db: Db, engine: OlafEngine) {
         loop {
             match db::claim_job(&db, "index") {
                 Ok(Some((job_id, payload, _attempts))) => {
-                    let result = process_index_job(&config, &db, &engine, &payload).await;
+                    let result =
+                        process_index_job(&config, &db, &engine, &download_client, &payload).await;
                     match result {
                         Ok(()) => {
-                            let _ = db::finish_job(&db, &job_id, None, 5);
+                            if let Some(item_id) =
+                                payload.get("catalog_item_id").and_then(Value::as_str)
+                            {
+                                let _ = enqueue_index_webhook(
+                                    &db,
+                                    item_id,
+                                    &job_id,
+                                    payload.get("callback_id").and_then(Value::as_str),
+                                    "catalog.index.completed",
+                                    None,
+                                );
+                            }
+                            let _ = db::finish_job(&db, &job_id, None, 1);
                         }
                         Err(error) => {
                             if let Some(item_id) =
@@ -198,8 +263,16 @@ pub async fn run_index_worker(config: Config, db: Db, engine: OlafEngine) {
                             {
                                 let _ =
                                     db::mark_catalog_item_error(&db, item_id, &error.to_string());
+                                let _ = enqueue_index_webhook(
+                                    &db,
+                                    item_id,
+                                    &job_id,
+                                    payload.get("callback_id").and_then(Value::as_str),
+                                    "catalog.index.failed",
+                                    Some(&error.to_string()),
+                                );
                             }
-                            let _ = db::finish_job(&db, &job_id, Some(&error.to_string()), 5);
+                            let _ = db::finish_job(&db, &job_id, Some(&error.to_string()), 1);
                         }
                     }
                 }
@@ -217,6 +290,7 @@ async fn process_index_job(
     config: &Config,
     db: &Db,
     engine: &OlafEngine,
+    client: &reqwest::Client,
     payload: &Value,
 ) -> Result<()> {
     let item_id = payload
@@ -230,24 +304,88 @@ async fn process_index_job(
         .clone()
         .unwrap_or_else(|| item.id.clone());
 
-    let bytes = if let Some(path) = payload.get("path").and_then(Value::as_str) {
-        tokio::fs::read(path).await?
-    } else if let Some(url) = payload.get("url").and_then(Value::as_str) {
-        let response = reqwest::get(url).await?;
-        if !response.status().is_success() {
-            return Err(anyhow!("download failed with {}", response.status()));
+    let (bytes, temp_path) = if let Some(path) = payload.get("path").and_then(Value::as_str) {
+        let metadata = tokio::fs::metadata(path).await?;
+        if metadata.len() > config.index.max_upload_bytes {
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(anyhow!(
+                "index source exceeds {} bytes",
+                config.index.max_upload_bytes
+            ));
         }
-        response.bytes().await?.to_vec()
+        match tokio::fs::read(path).await {
+            Ok(bytes) => (bytes, Some(path.to_string())),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(path).await;
+                return Err(error.into());
+            }
+        }
+    } else if let Some(url) = payload.get("url").and_then(Value::as_str) {
+        let dir = format!("{}/index", config.capture.temp_dir);
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = format!("{}/{}.bin", dir, item.id);
+        if let Err(error) =
+            download_to_file(client, url, &path, config.index.max_download_bytes).await
+        {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(error);
+        }
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => (bytes, Some(path)),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(error.into());
+            }
+        }
     } else {
         return Err(anyhow!("index job has no source"));
     };
 
-    engine.store(&fingerprint_id, bytes).await?;
-    db::mark_catalog_item_indexed(db, &item.id)?;
-    if let Some(path) = payload.get("path").and_then(Value::as_str) {
+    let force = payload
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    db::mark_catalog_item_indexing(db, &item.id)?;
+    let result = engine.store(&fingerprint_id, bytes, force).await;
+    if let Some(path) = temp_path {
         let _ = tokio::fs::remove_file(path).await;
     }
-    let _ = config;
+    result?;
+    db::mark_catalog_item_indexed(db, &item.id)?;
+    Ok(())
+}
+
+async fn download_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    path: &str,
+    max_bytes: u64,
+) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| anyhow!("index url is invalid"))?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow!("index url must use https"));
+    }
+    let response = client.get(parsed).send().await?;
+    if !response.status().is_success() {
+        return Err(anyhow!("download failed with {}", response.status()));
+    }
+    if let Some(length) = response.content_length() {
+        if length > max_bytes {
+            return Err(anyhow!("download exceeds {} bytes", max_bytes));
+        }
+    }
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut stream = response.bytes_stream();
+    let mut total = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        total += chunk.len() as u64;
+        if total > max_bytes {
+            return Err(anyhow!("download exceeds {} bytes", max_bytes));
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
     Ok(())
 }
 

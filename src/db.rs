@@ -28,6 +28,26 @@ pub fn migrate(db: &Db, sql: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn apply_migration(db: &Db, version: i64, sql: &str) -> Result<()> {
+    let conn = db.lock().unwrap();
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = ?",
+            params![version],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    conn.execute_batch(sql)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        params![version, now()],
+    )?;
+    Ok(())
+}
+
 fn catalogs_from_json(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -85,6 +105,7 @@ fn catalog_item_from_row(row: &Row<'_>) -> rusqlite::Result<CatalogItem> {
         status: row.get("status")?,
         indexed_at: row.get("indexed_at")?,
         error: row.get("error")?,
+        last_job_id: row.get("last_job_id")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -361,8 +382,8 @@ pub fn create_catalog_item(
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT INTO catalog_items
-             (id,catalog,external_id,name,type,metadata_json,fingerprint_id,status,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?)",
+             (id,catalog,external_id,name,type,metadata_json,fingerprint_id,status,last_job_id,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,?,?,NULL,?,?)",
             params![
                 id,
                 catalog,
@@ -378,6 +399,50 @@ pub fn create_catalog_item(
         )?;
     }
     get_catalog_item(db, &id)?.ok_or_else(|| anyhow!("catalog item not found after insert"))
+}
+
+pub fn find_catalog_item_by_catalog_external(
+    db: &Db,
+    catalog: &str,
+    external_id: &str,
+) -> Result<Option<CatalogItem>> {
+    let conn = db.lock().unwrap();
+    Ok(conn
+        .query_row(
+            "SELECT * FROM catalog_items WHERE catalog = ? AND external_id = ? LIMIT 1",
+            params![catalog, external_id],
+            catalog_item_from_row,
+        )
+        .optional()?)
+}
+
+pub fn set_catalog_item_job(db: &Db, id: &str, job_id: &str) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE catalog_items SET last_job_id = ?, status = 'pending', error = NULL, updated_at = ? WHERE id = ?",
+        params![job_id, now(), id],
+    )?;
+    Ok(())
+}
+
+pub fn mark_catalog_item_indexing(db: &Db, id: &str) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE catalog_items SET status = 'indexing', updated_at = ? WHERE id = ?",
+        params![now(), id],
+    )?;
+    Ok(())
+}
+
+pub fn first_enabled_callback_id(db: &Db) -> Result<Option<String>> {
+    let conn = db.lock().unwrap();
+    Ok(conn
+        .query_row(
+            "SELECT id FROM callbacks WHERE enabled = 1 ORDER BY created_at ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 pub fn get_catalog_item(db: &Db, id: &str) -> Result<Option<CatalogItem>> {
