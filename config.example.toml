@@ -7,7 +7,9 @@ health_public = true
 [olaf]
 rest_url = "http://127.0.0.1:8920"
 db_path = "/var/lib/ars"
+# Number of index jobs processed concurrently.
 store_concurrency = 1
+# Deprecated: query jobs now run one worker per active stream.
 query_concurrency = 4
 timeout_seconds = 120
 

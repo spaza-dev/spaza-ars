@@ -5,35 +5,71 @@ use crate::evidence;
 use crate::webhook::WebhookSender;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
-pub async fn run_query_worker(config: Config, db: Db, engine: OlafEngine) {
+const MAX_CONCURRENT_QUERY_STREAMS: usize = 20;
+
+pub async fn run_query_supervisor(config: Config, db: Db, engine: OlafEngine) {
     let mut ticker = interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut active: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
     loop {
         ticker.tick().await;
-        loop {
-            match db::claim_job(&db, "query") {
-                Ok(Some((job_id, payload, _attempts))) => {
-                    let result = process_query_job(&config, &db, &engine, &payload).await;
-                    match result {
-                        Ok(()) => {
-                            let _ = db::finish_job(&db, &job_id, None, 10);
-                        }
-                        Err(error) => {
-                            let _ = db::finish_job(&db, &job_id, Some(&error.to_string()), 10);
-                        }
+        active.retain(|_, handle| !handle.is_finished());
+
+        let streams = match db::query_streams_with_due_jobs(&db) {
+            Ok(streams) => streams,
+            Err(error) => {
+                tracing::warn!(%error, "query stream scan failed");
+                continue;
+            }
+        };
+
+        for stream_id in streams {
+            if active.len() >= MAX_CONCURRENT_QUERY_STREAMS {
+                break;
+            }
+            if active.contains_key(&stream_id) {
+                continue;
+            }
+            let task_config = config.clone();
+            let task_db = db.clone();
+            let task_engine = engine.clone();
+            let task_stream = stream_id.clone();
+            let handle = tokio::spawn(async move {
+                process_stream_queue(task_config, task_db, task_engine, task_stream).await;
+            });
+            active.insert(stream_id, handle);
+        }
+    }
+}
+
+async fn process_stream_queue(config: Config, db: Db, engine: OlafEngine, stream_id: String) {
+    tracing::debug!(stream_id = %stream_id, "query stream worker started");
+    loop {
+        match db::claim_query_job_for_stream(&db, &stream_id) {
+            Ok(Some((job_id, payload, _attempts))) => {
+                let result = process_query_job(&config, &db, &engine, &payload).await;
+                match result {
+                    Ok(()) => {
+                        let _ = db::finish_job(&db, &job_id, None, 10);
+                    }
+                    Err(error) => {
+                        let _ = db::finish_job(&db, &job_id, Some(&error.to_string()), 10);
                     }
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "query job claim failed");
-                    break;
-                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(stream_id = %stream_id, %error, "query job claim failed");
+                break;
             }
         }
     }
+    tracing::debug!(stream_id = %stream_id, "query stream worker idle");
 }
 
 async fn process_query_job(
@@ -697,6 +733,12 @@ mod tests {
             include_str!("../migrations/0004_stream_callback_mode.sql"),
         )
         .unwrap();
+        db::apply_migration(
+            &db,
+            5,
+            include_str!("../migrations/0005_query_scheduling.sql"),
+        )
+        .unwrap();
         db
     }
 
@@ -937,5 +979,55 @@ mod tests {
         assert_eq!(payloads[0]["matches"][0]["catalog"], "public");
         assert_eq!(payloads[0]["matches"][0]["type"], "jingle");
         assert_eq!(payloads[0]["matches"][0]["metadata"]["artist"], "Artist B");
+    }
+
+    #[test]
+    fn query_jobs_are_claimed_per_stream_and_deduplicated() {
+        let db = test_db();
+        db::enqueue_job(
+            &db,
+            "query",
+            &serde_json::json!({"stream_id": "s1", "path": "/work/s1/chunk-1.wav"}),
+            0,
+        )
+        .unwrap();
+        db::enqueue_job(
+            &db,
+            "query",
+            &serde_json::json!({"stream_id": "s1", "path": "/work/s1/chunk-2.wav"}),
+            0,
+        )
+        .unwrap();
+        db::enqueue_job(
+            &db,
+            "query",
+            &serde_json::json!({"stream_id": "s2", "path": "/work/s2/chunk-1.wav"}),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db::query_streams_with_due_jobs(&db).unwrap(),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+        assert!(db::query_job_exists_for_path(&db, "/work/s1/chunk-1.wav").unwrap());
+        assert!(!db::query_job_exists_for_path(&db, "/work/missing.wav").unwrap());
+
+        let first = db::claim_query_job_for_stream(&db, "s1").unwrap().unwrap();
+        assert_eq!(first.1["path"], "/work/s1/chunk-1.wav");
+        assert!(db::query_job_exists_for_path(&db, "/work/s1/chunk-1.wav").unwrap());
+
+        let second = db::claim_query_job_for_stream(&db, "s1").unwrap().unwrap();
+        assert_eq!(second.1["path"], "/work/s1/chunk-2.wav");
+        assert!(db::claim_query_job_for_stream(&db, "s1").unwrap().is_none());
+
+        let other = db::claim_query_job_for_stream(&db, "s2").unwrap().unwrap();
+        assert_eq!(other.1["stream_id"], "s2");
+
+        assert_eq!(db::reset_running_jobs(&db, "query").unwrap(), 3);
+        assert_eq!(
+            db::query_streams_with_due_jobs(&db).unwrap(),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
     }
 }

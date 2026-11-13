@@ -42,6 +42,20 @@ async fn main() -> Result<()> {
         4,
         include_str!("../migrations/0004_stream_callback_mode.sql"),
     )?;
+    db::apply_migration(
+        &db,
+        5,
+        include_str!("../migrations/0005_query_scheduling.sql"),
+    )?;
+
+    let reset_queries = db::reset_running_jobs(&db, "query")?;
+    if reset_queries > 0 {
+        tracing::info!(count = reset_queries, "requeued stale running query jobs");
+    }
+    let reset_index = db::reset_running_jobs(&db, "index")?;
+    if reset_index > 0 {
+        tracing::info!(count = reset_index, "requeued stale running index jobs");
+    }
 
     let engine = engine::OlafEngine::new(&config.olaf)?;
     let state = api::AppState {
@@ -51,16 +65,18 @@ async fn main() -> Result<()> {
     };
 
     tokio::spawn(capture::run_supervisor(config.clone(), db.clone()));
-    tokio::spawn(workers::run_query_worker(
+    tokio::spawn(workers::run_query_supervisor(
         config.clone(),
         db.clone(),
         engine.clone(),
     ));
-    tokio::spawn(workers::run_index_worker(
-        config.clone(),
-        db.clone(),
-        engine.clone(),
-    ));
+    for _ in 0..config.olaf.store_concurrency.max(1) {
+        tokio::spawn(workers::run_index_worker(
+            config.clone(),
+            db.clone(),
+            engine.clone(),
+        ));
+    }
     tokio::spawn(workers::run_aggregator(config.clone(), db.clone()));
     tokio::spawn(workers::run_cleanup(db.clone()));
     tokio::spawn(workers::run_webhook_worker(config.clone(), db.clone()));

@@ -220,6 +220,10 @@ async fn queue_completed_chunks(
         if age < Duration::from_secs(2) {
             continue;
         }
+        if db::query_job_exists_for_path(db, &key)? {
+            queued.insert(key);
+            continue;
+        }
         queued.insert(key.clone());
         let payload = serde_json::json!({
             "stream_id": stream.id,

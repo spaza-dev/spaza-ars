@@ -9,6 +9,7 @@ optional evidence clips.
 - Axum HTTP API with bearer auth and Swagger UI.
 - SQLite for streams, callbacks, jobs, detections, aggregates, webhooks and evidence.
 - Olaf REST sidecar on `127.0.0.1:8920` for fingerprint store/query.
+- One query worker per active stream, capped at 20 concurrent streams; `store_concurrency` index workers.
 - ffmpeg for stream capture and clip extraction.
 - yt-dlp for YouTube/Twitch stream resolution.
 - S3-compatible evidence upload using SigV4 PUT.
@@ -42,6 +43,15 @@ and Olaf if missing. It creates `/opt/ars`, `/etc/ars` and
 
 ```bash
 sudo bash scripts/update.sh
+```
+
+## Maintenance
+
+Clear a stuck query backlog (stops ARS, backs up the database, marks pending
+and running query jobs failed, and removes stale chunk files):
+
+```bash
+sudo bash scripts/clear-query-backlog.sh
 ```
 
 ## API
@@ -129,6 +139,15 @@ endpoint.
 
 Streams support `catalogs` as a JSON array, `evidence_enabled`, per-stream
 aggregation window, chunk duration and overlap.
+
+## Query scheduling
+
+Completed chunks enqueue `query` jobs. ARS runs one worker per active stream, up
+to 20 streams at a time, so streams are queried in parallel while chunks from
+the same stream keep their order. Additional streams wait for a free slot.
+Chunk paths with an active `pending` or `running` job are not enqueued again.
+Stale `running` jobs are requeued when ARS starts. `query_concurrency` is
+deprecated; `store_concurrency` controls concurrent index jobs.
 
 ## Webhooks
 

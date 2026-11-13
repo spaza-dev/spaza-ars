@@ -577,24 +577,49 @@ pub fn enqueue_job(
     Ok(id)
 }
 
-pub fn claim_job(db: &Db, kind: &str) -> Result<Option<(String, serde_json::Value, i64)>> {
+fn claim_job_filtered(
+    db: &Db,
+    kind: &str,
+    stream_id: Option<&str>,
+) -> Result<Option<(String, serde_json::Value, i64)>> {
     let now = now();
     let conn = db.lock().unwrap();
-    let row = conn
-        .query_row(
+    let mut stmt = if stream_id.is_some() {
+        conn.prepare(
+            "SELECT id,payload_json,attempts FROM jobs
+             WHERE kind = ? AND status = 'pending'
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               AND json_extract(payload_json, '$.stream_id') = ?
+             ORDER BY priority DESC, created_at ASC LIMIT 1",
+        )?
+    } else {
+        conn.prepare(
             "SELECT id,payload_json,attempts FROM jobs
              WHERE kind = ? AND status = 'pending'
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
              ORDER BY priority DESC, created_at ASC LIMIT 1",
-            params![kind, now],
-            |row| {
-                let id: String = row.get(0)?;
-                let payload: String = row.get(1)?;
-                let attempts: i64 = row.get(2)?;
-                Ok((id, payload, attempts))
-            },
-        )
-        .optional()?;
+        )?
+    };
+    let row = if let Some(stream_id) = stream_id {
+        stmt.query_row(params![kind, now, stream_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?
+    } else {
+        stmt.query_row(params![kind, now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?
+    };
+    drop(stmt);
     if let Some((id, payload, attempts)) = row {
         conn.execute(
             "UPDATE jobs SET status = 'running', attempts = ?, locked_at = ?, updated_at = ? WHERE id = ?",
@@ -604,6 +629,56 @@ pub fn claim_job(db: &Db, kind: &str) -> Result<Option<(String, serde_json::Valu
     } else {
         Ok(None)
     }
+}
+
+pub fn claim_job(db: &Db, kind: &str) -> Result<Option<(String, serde_json::Value, i64)>> {
+    claim_job_filtered(db, kind, None)
+}
+
+pub fn claim_query_job_for_stream(
+    db: &Db,
+    stream_id: &str,
+) -> Result<Option<(String, serde_json::Value, i64)>> {
+    claim_job_filtered(db, "query", Some(stream_id))
+}
+
+pub fn query_streams_with_due_jobs(db: &Db) -> Result<Vec<String>> {
+    let now = now();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT json_extract(payload_json, '$.stream_id') AS stream_id
+         FROM jobs
+         WHERE kind = 'query' AND status = 'pending'
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           AND json_extract(payload_json, '$.stream_id') IS NOT NULL
+         ORDER BY stream_id ASC",
+    )?;
+    let rows = stmt.query_map(params![now], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn query_job_exists_for_path(db: &Db, path: &str) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM jobs
+             WHERE kind = 'query' AND status IN ('pending', 'running')
+               AND json_extract(payload_json, '$.path') = ?
+         )",
+        params![path],
+        |row| row.get(0),
+    )?)
+}
+
+pub fn reset_running_jobs(db: &Db, kind: &str) -> Result<usize> {
+    let now = now();
+    let conn = db.lock().unwrap();
+    Ok(conn.execute(
+        "UPDATE jobs
+            SET status = 'pending', locked_at = NULL, next_attempt_at = NULL, updated_at = ?
+          WHERE kind = ? AND status = 'running'",
+        params![now, kind],
+    )?)
 }
 
 pub fn finish_job(db: &Db, id: &str, error: Option<&str>, max_attempts: i64) -> Result<()> {
