@@ -32,6 +32,11 @@ async fn main() -> Result<()> {
         2,
         include_str!("../migrations/0002_catalog_idempotency.sql"),
     )?;
+    db::apply_migration(
+        &db,
+        3,
+        include_str!("../migrations/0003_outbox_updated_at.sql"),
+    )?;
 
     let engine = engine::OlafEngine::new(&config.olaf)?;
     let state = api::AppState {

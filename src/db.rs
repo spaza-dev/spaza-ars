@@ -802,8 +802,8 @@ pub fn mark_webhook_failed(db: &Db, id: &str, error: &str, max_attempts: i64) ->
     )?;
     if attempts + 1 >= max_attempts {
         conn.execute(
-            "UPDATE webhook_outbox SET status = 'failed', attempts = attempts + 1, last_error = ? WHERE id = ?",
-            params![error, id],
+            "UPDATE webhook_outbox SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?",
+            params![error, now(), id],
         )?;
     } else {
         let delay = std::cmp::min(
@@ -812,8 +812,8 @@ pub fn mark_webhook_failed(db: &Db, id: &str, error: &str, max_attempts: i64) ->
         );
         let next = (Utc::now() + Duration::seconds(delay)).to_rfc3339();
         conn.execute(
-            "UPDATE webhook_outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ?",
-            params![error, next, id],
+            "UPDATE webhook_outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?",
+            params![error, next, now(), id],
         )?;
     }
     Ok(())
