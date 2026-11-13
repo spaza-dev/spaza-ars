@@ -195,6 +195,14 @@ fn env_or(name: &str, current: String) -> String {
     env::var(name).unwrap_or(current)
 }
 
+fn config_or_env(name: &str, current: String) -> String {
+    if current.is_empty() {
+        env::var(name).unwrap_or(current)
+    } else {
+        current
+    }
+}
+
 impl Config {
     pub fn configured_catalog_bucket(&self) -> Option<String> {
         self.index
@@ -309,17 +317,15 @@ impl Config {
         config.evidence.enabled = env::var("ARS_EVIDENCE_ENABLED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(config.evidence.enabled);
-        config.evidence.endpoint = env_or("ARS_EVIDENCE_S3_ENDPOINT", config.evidence.endpoint);
-        config.evidence.region = env_or("ARS_EVIDENCE_S3_REGION", config.evidence.region);
-        config.evidence.bucket = env_or("ARS_EVIDENCE_S3_BUCKET", config.evidence.bucket);
+        config.evidence.endpoint =
+            config_or_env("ARS_EVIDENCE_S3_ENDPOINT", config.evidence.endpoint);
+        config.evidence.region = config_or_env("ARS_EVIDENCE_S3_REGION", config.evidence.region);
+        config.evidence.bucket = config_or_env("ARS_EVIDENCE_S3_BUCKET", config.evidence.bucket);
         config.evidence.access_key =
-            env_or("ARS_EVIDENCE_S3_ACCESS_KEY", config.evidence.access_key);
+            config_or_env("ARS_EVIDENCE_S3_ACCESS_KEY", config.evidence.access_key);
         config.evidence.secret_key =
-            env_or("ARS_EVIDENCE_S3_SECRET_KEY", config.evidence.secret_key);
-        config.evidence.prefix = env_or("ARS_EVIDENCE_S3_PREFIX", config.evidence.prefix);
-        config.evidence.path_style = env::var("ARS_EVIDENCE_S3_PATH_STYLE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(config.evidence.path_style);
+            config_or_env("ARS_EVIDENCE_S3_SECRET_KEY", config.evidence.secret_key);
+        config.evidence.prefix = config_or_env("ARS_EVIDENCE_S3_PREFIX", config.evidence.prefix);
 
         config.webhook.signing_secret =
             env_or("ARS_WEBHOOK_SIGNING_SECRET", config.webhook.signing_secret);
@@ -336,15 +342,44 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(config.index.max_upload_bytes);
-        config.index.catalog_bucket = env::var("ARS_CATALOG_S3_BUCKET")
-            .ok()
+        config.index.catalog_bucket = config
+            .index
+            .catalog_bucket
             .filter(|value| !value.is_empty())
-            .or(config.index.catalog_bucket);
-        config.index.catalog_prefix = env::var("ARS_CATALOG_S3_PREFIX")
-            .ok()
+            .or_else(|| {
+                env::var("ARS_CATALOG_S3_BUCKET")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+        config.index.catalog_prefix = config
+            .index
+            .catalog_prefix
             .filter(|value| !value.is_empty())
-            .or(config.index.catalog_prefix);
+            .or_else(|| {
+                env::var("ARS_CATALOG_S3_PREFIX")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_values_win_over_env_fallbacks() {
+        std::env::set_var("ARS_TEST_CONFIG_OR_ENV", "from-env");
+        assert_eq!(
+            config_or_env("ARS_TEST_CONFIG_OR_ENV", "from-config".into()),
+            "from-config"
+        );
+        assert_eq!(
+            config_or_env("ARS_TEST_CONFIG_OR_ENV", String::new()),
+            "from-env"
+        );
+        std::env::remove_var("ARS_TEST_CONFIG_OR_ENV");
     }
 }

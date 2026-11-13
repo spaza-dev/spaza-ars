@@ -30,9 +30,10 @@ dedupe_window_seconds = 30
 enabled = true
 endpoint = "https://fbcd54084e4deedee804e7222c65d5e3.r2.cloudflarestorage.com"
 region = "auto"
-bucket = "broadcast-index-archive"
-secret_key = "0a571ab38ab7f3359555c6da990657580d7d27b50207e1d96392ad134f08c1d2"
-access_key = "7d4743fa6be4ff9226b456812ac1c7dc"
+bucket = "evidence"
+# config.toml values take precedence over ARS_EVIDENCE_S3_* env vars.
+secret_key = "b68a7215ef7985a4990d9d84af360338ed0640883ca28fb3c302d5f4689faa57"
+access_key = "bf29a16d54b62c72b40b340e10f5993c"
 prefix = "evidence"
 path_style = true
 pre_seconds = 10

@@ -114,12 +114,13 @@ idempotent on `catalog + external_id`:
 
 Index jobs read the object directly from S3/R2 using the `[evidence]`
 credentials, enforce a timeout and maximum size, then forward the audio to
-Olaf `/api/store`. When `ARS_CATALOG_S3_BUCKET` / `[index] catalog_bucket` is
-set, the request bucket must match it; otherwise the request bucket is used,
-falling back to `evidence.bucket` when the request omits a bucket. Set
-`ARS_CATALOG_S3_PREFIX` / `[index] catalog_prefix` to restrict keys to one
-prefix. Temporary files are removed after success or failure. Index jobs are
-single-attempt.
+Olaf `/api/store`. When `[index] catalog_bucket` is set, the request bucket
+must match it; otherwise the request bucket is used, falling back to
+`evidence.bucket` when the request omits a bucket. Set `[index] catalog_prefix`
+to restrict keys to one prefix. The `ARS_CATALOG_S3_BUCKET` /
+`ARS_CATALOG_S3_PREFIX` env vars are only fallbacks: values in `config.toml`
+take precedence. Temporary files are removed after success or failure. Index
+jobs are single-attempt.
 
 The same idempotency rules apply to the multipart `POST /v1/catalog/items`
 endpoint.
@@ -141,8 +142,10 @@ Both can be enabled per callback (`auth_type = "both"`).
 ## Evidence
 
 When `evidence_enabled` is set on a stream, the service uploads the matched
-audio chunk to the configured S3 bucket and includes the evidence object in the
-webhook payload.
+audio chunk to the `[evidence] bucket` and includes the evidence object in the
+webhook payload. Evidence S3 settings in `config.toml` take precedence over
+`ARS_EVIDENCE_S3_*` env vars; the env vars are only used when the config value
+is empty. `path_style` is configured only through `config.toml`.
 
 ## Limitations
 
