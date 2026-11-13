@@ -37,6 +37,11 @@ async fn main() -> Result<()> {
         3,
         include_str!("../migrations/0003_outbox_updated_at.sql"),
     )?;
+    db::apply_migration(
+        &db,
+        4,
+        include_str!("../migrations/0004_stream_callback_mode.sql"),
+    )?;
 
     let engine = engine::OlafEngine::new(&config.olaf)?;
     let state = api::AppState {

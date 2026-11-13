@@ -246,7 +246,8 @@ async fn list_streams(
             "evidence_enabled": false,
             "chunk_seconds": 10,
             "overlap_seconds": 2,
-            "aggregation_window_seconds": 60
+            "aggregation_window_seconds": 60,
+            "callback_mode": "after"
         })
     ),
     responses(
@@ -306,7 +307,8 @@ async fn get_stream(
             "url": "https://example.com/new-stream.mp3",
             "catalogs": ["private"],
             "enabled": true,
-            "aggregation_window_seconds": 30
+            "aggregation_window_seconds": 30,
+            "callback_mode": "after"
         })
     ),
     responses(
@@ -408,6 +410,7 @@ async fn stop_stream(
         evidence_pre_seconds: None,
         evidence_post_seconds: None,
         callback_id: None,
+        callback_mode: None,
         chunk_seconds: None,
         overlap_seconds: None,
         aggregation_window_seconds: None,

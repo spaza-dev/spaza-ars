@@ -28,6 +28,7 @@ pub struct Stream {
     pub evidence_pre_seconds: i64,
     pub evidence_post_seconds: i64,
     pub callback_id: Option<String>,
+    pub callback_mode: String,
     pub chunk_seconds: i64,
     pub overlap_seconds: i64,
     pub aggregation_window_seconds: Option<i64>,
@@ -58,6 +59,8 @@ pub struct CreateStream {
     pub evidence_pre_seconds: Option<i64>,
     pub evidence_post_seconds: Option<i64>,
     pub callback_id: Option<String>,
+    #[serde(default = "default_callback_mode")]
+    pub callback_mode: String,
     pub chunk_seconds: Option<i64>,
     pub overlap_seconds: Option<i64>,
     pub aggregation_window_seconds: Option<i64>,
@@ -75,6 +78,7 @@ pub struct UpdateStream {
     pub evidence_pre_seconds: Option<i64>,
     pub evidence_post_seconds: Option<i64>,
     pub callback_id: Option<String>,
+    pub callback_mode: Option<String>,
     pub chunk_seconds: Option<i64>,
     pub overlap_seconds: Option<i64>,
     pub aggregation_window_seconds: Option<i64>,
@@ -218,6 +222,10 @@ pub struct QueryRequest {
 
 fn default_source_type() -> String {
     "radio".into()
+}
+
+fn default_callback_mode() -> String {
+    "after".into()
 }
 
 fn default_true() -> bool {

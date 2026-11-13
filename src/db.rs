@@ -52,6 +52,14 @@ fn catalogs_from_json(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+fn normalize_callback_mode(value: &str) -> String {
+    if value.eq_ignore_ascii_case("before") {
+        "before".into()
+    } else {
+        "after".into()
+    }
+}
+
 fn stream_from_row(row: &Row<'_>) -> rusqlite::Result<Stream> {
     let catalogs_raw: String = row.get("catalogs")?;
     Ok(Stream {
@@ -66,6 +74,7 @@ fn stream_from_row(row: &Row<'_>) -> rusqlite::Result<Stream> {
         evidence_pre_seconds: row.get("evidence_pre_seconds")?,
         evidence_post_seconds: row.get("evidence_post_seconds")?,
         callback_id: row.get("callback_id")?,
+        callback_mode: row.get("callback_mode")?,
         chunk_seconds: row.get("chunk_seconds")?,
         overlap_seconds: row.get("overlap_seconds")?,
         aggregation_window_seconds: row.get("aggregation_window_seconds")?,
@@ -156,14 +165,18 @@ pub fn create_stream(db: &Db, input: CreateStream) -> Result<Stream> {
     let id = format!("str_{}", uuid::Uuid::new_v4().simple());
     let now = now();
     let catalogs = serde_json::to_string(&input.catalogs)?;
+    let callback_id = match input.callback_id {
+        Some(callback_id) => Some(callback_id),
+        None => first_enabled_callback_id(db)?,
+    };
     {
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT INTO streams
              (id,name,url,source_type,external_id,catalogs,enabled,evidence_enabled,
-              evidence_pre_seconds,evidence_post_seconds,callback_id,chunk_seconds,
+              evidence_pre_seconds,evidence_post_seconds,callback_id,callback_mode,chunk_seconds,
               overlap_seconds,aggregation_window_seconds,status,created_at,updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 id,
                 input.name,
@@ -175,7 +188,8 @@ pub fn create_stream(db: &Db, input: CreateStream) -> Result<Stream> {
                 if input.evidence_enabled { 1 } else { 0 },
                 input.evidence_pre_seconds.unwrap_or(10),
                 input.evidence_post_seconds.unwrap_or(20),
-                input.callback_id,
+                callback_id,
+                normalize_callback_mode(&input.callback_mode),
                 input.chunk_seconds.unwrap_or(10),
                 input.overlap_seconds.unwrap_or(2),
                 input.aggregation_window_seconds,
@@ -205,13 +219,29 @@ pub fn update_stream(db: &Db, id: &str, input: UpdateStream) -> Result<Option<St
         .enabled
         .map(|v| if v { 1 } else { 0 })
         .unwrap_or(existing.enabled);
+    let callback_id = match input.callback_id {
+        Some(callback_id) => Some(callback_id),
+        None => match existing.callback_id {
+            Some(callback_id) => Some(callback_id),
+            None => first_enabled_callback_id(db)?,
+        },
+    };
+    let status = if enabled != existing.enabled {
+        if enabled == 1 {
+            "starting".to_string()
+        } else {
+            "stopped".to_string()
+        }
+    } else {
+        existing.status.clone()
+    };
     {
         let conn = db.lock().unwrap();
         conn.execute(
             "UPDATE streams SET
                name = ?, url = ?, source_type = ?, external_id = ?, catalogs = ?,
                enabled = ?, evidence_enabled = ?, evidence_pre_seconds = ?,
-               evidence_post_seconds = ?, callback_id = ?, chunk_seconds = ?,
+               evidence_post_seconds = ?, callback_id = ?, callback_mode = ?, chunk_seconds = ?,
                overlap_seconds = ?, aggregation_window_seconds = ?, status = ?,
                updated_at = ?
              WHERE id = ?",
@@ -232,13 +262,17 @@ pub fn update_stream(db: &Db, id: &str, input: UpdateStream) -> Result<Option<St
                 input
                     .evidence_post_seconds
                     .unwrap_or(existing.evidence_post_seconds),
-                input.callback_id.or(existing.callback_id),
+                callback_id,
+                input
+                    .callback_mode
+                    .map(|value| normalize_callback_mode(&value))
+                    .unwrap_or(existing.callback_mode),
                 input.chunk_seconds.unwrap_or(existing.chunk_seconds),
                 input.overlap_seconds.unwrap_or(existing.overlap_seconds),
                 input
                     .aggregation_window_seconds
                     .or(existing.aggregation_window_seconds),
-                if enabled == 1 { "starting" } else { "stopped" },
+                status,
                 now,
                 id
             ],
@@ -253,11 +287,38 @@ pub fn delete_stream(db: &Db, id: &str) -> Result<bool> {
 }
 
 pub fn set_stream_status(db: &Db, id: &str, status: &str, error: Option<&str>) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE streams SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
-        params![status, error, now(), id],
-    )?;
+    let existing = match get_stream(db, id)? {
+        Some(stream) => stream,
+        None => return Ok(()),
+    };
+    if existing.status == status && existing.last_error.as_deref() == error {
+        return Ok(());
+    }
+    let changed_at = now();
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE streams SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            params![status, error, changed_at, id],
+        )?;
+    }
+    if let Some(callback_id) = existing.callback_id {
+        let payload = serde_json::json!({
+            "event": "stream.status",
+            "stream_id": existing.id,
+            "external_stream_id": existing.external_id,
+            "status": status,
+            "error": error,
+            "time": changed_at,
+        });
+        enqueue_webhook(
+            db,
+            &callback_id,
+            "stream.status",
+            &payload,
+            &format!("stream-status:{}:{}:{}", existing.id, status, changed_at),
+        )?;
+    }
     Ok(())
 }
 
@@ -639,6 +700,58 @@ pub fn pending_streams_with_detections(db: &Db) -> Result<Vec<String>> {
         conn.prepare("SELECT DISTINCT stream_id FROM detections WHERE aggregated_at IS NULL")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn get_stream_match_state(
+    db: &Db,
+    stream_id: &str,
+    catalog_item_id: &str,
+) -> Result<Option<(String, String, Option<String>)>> {
+    let conn = db.lock().unwrap();
+    Ok(conn
+        .query_row(
+            "SELECT started_at,last_seen_at,callback_sent_at FROM stream_match_state
+             WHERE stream_id = ? AND catalog_item_id = ?",
+            params![stream_id, catalog_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?)
+}
+
+pub fn upsert_stream_match_state(
+    db: &Db,
+    stream_id: &str,
+    catalog_item_id: &str,
+    started_at: &str,
+    last_seen_at: &str,
+    callback_sent_at: Option<&str>,
+) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO stream_match_state
+         (stream_id,catalog_item_id,started_at,last_seen_at,callback_sent_at)
+         VALUES (?,?,?,?,?)
+         ON CONFLICT(stream_id,catalog_item_id) DO UPDATE SET
+           started_at = excluded.started_at,
+           last_seen_at = excluded.last_seen_at,
+           callback_sent_at = COALESCE(excluded.callback_sent_at, stream_match_state.callback_sent_at)",
+        params![
+            stream_id,
+            catalog_item_id,
+            started_at,
+            last_seen_at,
+            callback_sent_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn cleanup_stream_match_state(db: &Db, cutoff: &str) -> Result<usize> {
+    let conn = db.lock().unwrap();
+    Ok(conn.execute(
+        "DELETE FROM stream_match_state WHERE last_seen_at < ?",
+        params![cutoff],
+    )?)
 }
 
 pub fn create_aggregate(
