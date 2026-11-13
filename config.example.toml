@@ -48,3 +48,7 @@ signing_secret = ""
 download_timeout_seconds = 120
 max_download_bytes = 104857600
 max_upload_bytes = 104857600
+# Catalog reads reuse the [evidence] S3 credentials above.
+catalog_bucket = "airplay-audd-catalog"
+# Optional key allowlist; leave unset to accept any key in the catalog bucket.
+# catalog_prefix = "catalog/"

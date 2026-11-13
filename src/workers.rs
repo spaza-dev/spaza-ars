@@ -4,10 +4,8 @@ use crate::engine::OlafEngine;
 use crate::evidence;
 use crate::webhook::WebhookSender;
 use anyhow::{anyhow, Result};
-use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::time::{interval, MissedTickBehavior};
 
 pub async fn run_query_worker(config: Config, db: Db, engine: OlafEngine) {
@@ -320,12 +318,23 @@ async fn process_index_job(
                 return Err(error.into());
             }
         }
-    } else if let Some(url) = payload.get("url").and_then(Value::as_str) {
+    } else if let Some(key) = payload.get("object_key").and_then(Value::as_str) {
+        let requested_bucket = payload.get("object_bucket").and_then(Value::as_str);
+        let bucket = config
+            .resolve_catalog_bucket(requested_bucket)
+            .map_err(|message| anyhow!(message))?;
         let dir = format!("{}/index", config.capture.temp_dir);
         tokio::fs::create_dir_all(&dir).await?;
         let path = format!("{}/{}.bin", dir, item.id);
-        if let Err(error) =
-            download_to_file(client, url, &path, config.index.max_download_bytes).await
+        if let Err(error) = evidence::download_object(
+            client,
+            &config.evidence,
+            &bucket,
+            key,
+            &path,
+            config.index.max_download_bytes,
+        )
+        .await
         {
             let _ = tokio::fs::remove_file(&path).await;
             return Err(error);
@@ -352,40 +361,6 @@ async fn process_index_job(
     }
     result?;
     db::mark_catalog_item_indexed(db, &item.id)?;
-    Ok(())
-}
-
-async fn download_to_file(
-    client: &reqwest::Client,
-    url: &str,
-    path: &str,
-    max_bytes: u64,
-) -> Result<()> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| anyhow!("index url is invalid"))?;
-    if parsed.scheme() != "https" {
-        return Err(anyhow!("index url must use https"));
-    }
-    let response = client.get(parsed).send().await?;
-    if !response.status().is_success() {
-        return Err(anyhow!("download failed with {}", response.status()));
-    }
-    if let Some(length) = response.content_length() {
-        if length > max_bytes {
-            return Err(anyhow!("download exceeds {} bytes", max_bytes));
-        }
-    }
-    let mut file = tokio::fs::File::create(path).await?;
-    let mut stream = response.bytes_stream();
-    let mut total = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        total += chunk.len() as u64;
-        if total > max_bytes {
-            return Err(anyhow!("download exceeds {} bytes", max_bytes));
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
     Ok(())
 }
 

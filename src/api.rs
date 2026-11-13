@@ -43,7 +43,7 @@ pub struct AppState {
     components(schemas(
         Stream, CreateStream, UpdateStream,
         Callback, CreateCallback, UpdateCallback,
-        CatalogItem, IndexItemJson, IndexItemMultipart,
+        CatalogItem, IndexItemJson, IndexItemMultipart, IndexObject,
         Detection, DetectionAggregate,
         QueryRequest, QueryResponse,
         JobAccepted, JobStatus,
@@ -616,7 +616,7 @@ async fn get_catalog_item(
 }
 
 enum IndexSource {
-    Url(String),
+    Object { bucket: Option<String>, key: String },
     File,
 }
 
@@ -629,26 +629,12 @@ struct IndexRequest {
     source: IndexSource,
     force: bool,
     callback_id: Option<String>,
-    url_expires_at: Option<String>,
 }
 
-fn validate_index_url(url: &str, expires_at: Option<&str>) -> Result<(), ApiError> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|_| err(StatusCode::BAD_REQUEST, "url is invalid"))?;
-    if parsed.scheme() != "https" {
-        return Err(err(StatusCode::BAD_REQUEST, "url must use https"));
-    }
-    if let Some(expires_at) = expires_at {
-        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
-            .map_err(|_| err(StatusCode::BAD_REQUEST, "url_expires_at must be RFC3339"))?;
-        if expires.timestamp() < chrono::Utc::now().timestamp() {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                "url_expires_at is in the past",
-            ));
-        }
-    }
-    Ok(())
+fn validate_index_object(config: &Config, bucket: Option<&str>, key: &str) -> Result<(), ApiError> {
+    config
+        .validate_catalog_object(bucket, key)
+        .map_err(|message| err(StatusCode::BAD_REQUEST, message))
 }
 
 fn existing_response(
@@ -700,7 +686,7 @@ fn enqueue_for_item(
         IndexSource::File => {
             let path = temp_path
                 .take()
-                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "provide a file or url"))?;
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "provide a file or object"))?;
             json!({
                 "catalog_item_id": item.id,
                 "path": path,
@@ -708,9 +694,10 @@ fn enqueue_for_item(
                 "force": force,
             })
         }
-        IndexSource::Url(url) => json!({
+        IndexSource::Object { bucket, key } => json!({
             "catalog_item_id": item.id,
-            "url": url,
+            "object_bucket": bucket,
+            "object_key": key,
             "callback_id": callback_id,
             "force": force,
         }),
@@ -742,10 +729,12 @@ fn queue_index(
         return Err(err(StatusCode::BAD_REQUEST, "name is required"));
     }
     match &request.source {
-        IndexSource::Url(url) => validate_index_url(url, request.url_expires_at.as_deref())?,
+        IndexSource::Object { bucket, key } => {
+            validate_index_object(&state.config, bucket.as_deref(), key)?
+        }
         IndexSource::File => {
             if temp_path.is_none() {
-                return Err(err(StatusCode::BAD_REQUEST, "provide a file or url"));
+                return Err(err(StatusCode::BAD_REQUEST, "provide a file or object"));
             }
         }
     }
@@ -867,15 +856,15 @@ async fn write_multipart_file(
     request_body(
         content = IndexItemMultipart,
         content_type = "multipart/form-data",
-        description = "Index an audio item from a file or a presigned HTTPS URL. Idempotent on catalog + external_id.",
+        description = "Index an audio item from a file or a stored object. Idempotent on catalog + external_id.",
         example = json!({
             "name": "Song A",
             "catalog": "private",
             "external_id": "12345",
             "type": "song",
             "metadata": "{\"artist\":\"Artist A\",\"album\":\"Album A\"}",
-            "url": "https://...presigned-r2-get...",
-            "url_expires_at": "2026-11-13T10:15:00Z",
+            "object_bucket": "airplay-audd-catalog",
+            "object_key": "catalog/123/song.mp3",
             "callback_id": "cb_123",
             "force": "false"
         })
@@ -906,8 +895,8 @@ async fn index_catalog_item(
     let mut item_type = "song".to_string();
     let mut metadata = json!({});
     let mut temp_path: Option<String> = None;
-    let mut url: Option<String> = None;
-    let mut url_expires_at: Option<String> = None;
+    let mut object_bucket: Option<String> = None;
+    let mut object_key: Option<String> = None;
     let mut callback_id: Option<String> = None;
     let mut force = false;
 
@@ -935,16 +924,16 @@ async fn index_catalog_item(
                     let _ = tokio::fs::remove_file(existing).await;
                 }
             }
-            "url" => {
-                url = Some(
+            "object_bucket" => {
+                object_bucket = Some(
                     field
                         .text()
                         .await
                         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?,
                 )
             }
-            "url_expires_at" => {
-                url_expires_at = Some(
+            "object_key" => {
+                object_key = Some(
                     field
                         .text()
                         .await
@@ -977,10 +966,13 @@ async fn index_catalog_item(
 
     let source = if temp_path.is_some() {
         IndexSource::File
-    } else if let Some(url) = url {
-        IndexSource::Url(url)
+    } else if let Some(key) = object_key {
+        IndexSource::Object {
+            bucket: object_bucket,
+            key,
+        }
     } else {
-        return Err(err(StatusCode::BAD_REQUEST, "provide a file or url"));
+        return Err(err(StatusCode::BAD_REQUEST, "provide a file or object"));
     };
 
     let request = IndexRequest {
@@ -992,7 +984,6 @@ async fn index_catalog_item(
         source,
         force,
         callback_id,
-        url_expires_at,
     };
     let outcome = queue_index(&state, request, &mut temp_path);
     if let Some(path) = temp_path.take() {
@@ -1008,15 +999,14 @@ async fn index_catalog_item(
     security(("bearer_auth" = [])),
     request_body(
         content = IndexItemJson,
-        description = "Index an audio item from a presigned HTTPS URL. Idempotent on catalog + external_id; 200 when already indexed, 202 when queued.",
+        description = "Index an audio item from a stored object. Idempotent on catalog + external_id; 200 when already indexed, 202 when queued.",
         example = json!({
             "catalog": "private",
             "external_id": "12345",
             "name": "Song A",
             "type": "song",
             "metadata": {"artist": "Artist A", "album": "Album A"},
-            "url": "https://...presigned-r2-get...",
-            "url_expires_at": "2026-11-13T10:15:00Z",
+            "object": {"bucket": "airplay-audd-catalog", "key": "catalog/123/song.mp3"},
             "callback_id": "cb_123",
             "force": false
         })
@@ -1041,10 +1031,12 @@ async fn index_catalog_item_json(
         name: input.name,
         item_type: input.item_type.unwrap_or_else(|| "song".into()),
         metadata: input.metadata.unwrap_or_else(|| json!({})),
-        source: IndexSource::Url(input.url),
+        source: IndexSource::Object {
+            bucket: input.object.bucket,
+            key: input.object.key,
+        },
         force: input.force,
         callback_id: input.callback_id,
-        url_expires_at: input.url_expires_at,
     };
     let mut temp_path = None;
     queue_index(&state, request, &mut temp_path)
@@ -1288,17 +1280,25 @@ mod tests {
     }
 
     #[test]
-    fn index_url_validation_requires_https_and_future_expiry() {
-        assert!(validate_index_url("https://example.com/a.mp3", None).is_ok());
-        assert!(validate_index_url("http://example.com/a.mp3", None).is_err());
-        assert!(validate_index_url("not a url", None).is_err());
+    fn index_object_validation_checks_bucket_and_key() {
+        let mut config = Config::default();
+        config.evidence.bucket = "airplay-audd-catalog".into();
+        config.index.catalog_prefix = Some("catalog/".into());
+
         assert!(
-            validate_index_url("https://example.com/a.mp3", Some("2999-01-01T00:00:00Z")).is_ok()
+            validate_index_object(&config, Some("airplay-audd-catalog"), "catalog/1/a.mp3").is_ok()
         );
+        assert!(validate_index_object(&config, None, "catalog/1/a.mp3").is_ok());
+        assert!(validate_index_object(&config, None, "").is_err());
+        assert!(validate_index_object(&config, None, "/catalog/1/a.mp3").is_err());
+        assert!(validate_index_object(&config, None, "catalog/../a.mp3").is_err());
+        assert!(validate_index_object(&config, None, "other/a.mp3").is_err());
+
+        config.index.catalog_bucket = Some("airplay-audd-catalog".into());
         assert!(
-            validate_index_url("https://example.com/a.mp3", Some("2000-01-01T00:00:00Z")).is_err()
+            validate_index_object(&config, Some("airplay-audd-catalog"), "catalog/1/a.mp3").is_ok()
         );
-        assert!(validate_index_url("https://example.com/a.mp3", Some("nope")).is_err());
+        assert!(validate_index_object(&config, Some("other"), "catalog/1/a.mp3").is_err());
     }
 
     #[test]
@@ -1314,7 +1314,8 @@ mod tests {
         )
         .expect("migrate 2");
 
-        let config = Config::default();
+        let mut config = Config::default();
+        config.evidence.bucket = "airplay-audd-catalog".into();
         let state = AppState {
             config: config.clone(),
             db: db.clone(),
@@ -1327,10 +1328,12 @@ mod tests {
             name: "Idem Song".into(),
             item_type: "song".into(),
             metadata: json!({}),
-            source: IndexSource::Url("https://example.com/song.mp3".into()),
+            source: IndexSource::Object {
+                bucket: Some("airplay-audd-catalog".into()),
+                key: "catalog/song.mp3".into(),
+            },
             force: false,
             callback_id: None,
-            url_expires_at: None,
         };
 
         let mut temp_path = None;

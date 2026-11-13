@@ -107,6 +107,14 @@ pub struct UpdateCallback {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct IndexObject {
+    #[schema(example = "airplay-audd-catalog")]
+    pub bucket: Option<String>,
+    #[schema(example = "catalog/123/song.mp3")]
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IndexItemJson {
     #[schema(example = "private")]
     pub catalog: Option<String>,
@@ -118,10 +126,7 @@ pub struct IndexItemJson {
     #[schema(example = "song")]
     pub item_type: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    #[schema(example = "https://...presigned-r2-get...")]
-    pub url: String,
-    #[schema(example = "2026-11-13T10:15:00Z")]
-    pub url_expires_at: Option<String>,
+    pub object: IndexObject,
     #[schema(example = "cb_123")]
     pub callback_id: Option<String>,
     #[serde(default)]
@@ -268,10 +273,10 @@ pub struct TestWebhookRequest {
 pub struct IndexItemMultipart {
     #[schema(format = Binary, value_type = String)]
     pub file: Option<String>,
-    #[schema(example = "https://...presigned-r2-get...")]
-    pub url: Option<String>,
-    #[schema(example = "2026-11-13T10:15:00Z")]
-    pub url_expires_at: Option<String>,
+    #[schema(example = "airplay-audd-catalog")]
+    pub object_bucket: Option<String>,
+    #[schema(example = "catalog/123/song.mp3")]
+    pub object_key: Option<String>,
     #[schema(example = "Song A")]
     pub name: String,
     #[schema(example = "private")]

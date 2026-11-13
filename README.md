@@ -91,17 +91,35 @@ so ARS registers the console callback URL and callback credentials.
 
 ## Catalog indexing
 
-`POST /v1/catalog/items/json` accepts a presigned HTTPS GET URL and is
+`POST /v1/catalog/items/json` accepts a stored object reference and is
 idempotent on `catalog + external_id`:
+
+```json
+{
+  "catalog": "private",
+  "external_id": "12345",
+  "name": "Song A",
+  "type": "song",
+  "object": {
+    "bucket": "airplay-audd-catalog",
+    "key": "catalog/123/song.mp3"
+  },
+  "force": false
+}
+```
 
 - `200` when the item is already indexed and `force` is false.
 - `202` when an index job is queued or already running.
 - `force=true` re-indexes an existing item.
 
-Index jobs download the URL to a temporary file, enforce HTTPS, a timeout and
-a maximum size, then forward the audio to Olaf `/api/store`. Temporary files
-are removed after success or failure. Index jobs are single-attempt; the
-console generates a fresh presigned URL when resubmitting.
+Index jobs read the object directly from S3/R2 using the `[evidence]`
+credentials, enforce a timeout and maximum size, then forward the audio to
+Olaf `/api/store`. When `ARS_CATALOG_S3_BUCKET` / `[index] catalog_bucket` is
+set, the request bucket must match it; otherwise the request bucket is used,
+falling back to `evidence.bucket` when the request omits a bucket. Set
+`ARS_CATALOG_S3_PREFIX` / `[index] catalog_prefix` to restrict keys to one
+prefix. Temporary files are removed after success or failure. Index jobs are
+single-attempt.
 
 The same idempotency rules apply to the multipart `POST /v1/catalog/items`
 endpoint.

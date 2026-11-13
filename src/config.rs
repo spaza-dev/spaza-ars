@@ -83,6 +83,10 @@ pub struct IndexConfig {
     pub download_timeout_seconds: u64,
     pub max_download_bytes: u64,
     pub max_upload_bytes: u64,
+    #[serde(default)]
+    pub catalog_bucket: Option<String>,
+    #[serde(default)]
+    pub catalog_prefix: Option<String>,
 }
 
 impl Default for Config {
@@ -181,6 +185,8 @@ impl Default for IndexConfig {
             download_timeout_seconds: 120,
             max_download_bytes: 100 * 1024 * 1024,
             max_upload_bytes: 100 * 1024 * 1024,
+            catalog_bucket: None,
+            catalog_prefix: None,
         }
     }
 }
@@ -190,6 +196,58 @@ fn env_or(name: &str, current: String) -> String {
 }
 
 impl Config {
+    pub fn configured_catalog_bucket(&self) -> Option<String> {
+        self.index
+            .catalog_bucket
+            .clone()
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn catalog_prefix(&self) -> Option<String> {
+        self.index
+            .catalog_prefix
+            .clone()
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn resolve_catalog_bucket(&self, requested: Option<&str>) -> Result<String, String> {
+        let requested = requested.filter(|value| !value.is_empty());
+        let bucket = match (self.configured_catalog_bucket(), requested) {
+            (Some(configured), Some(requested)) if requested != configured => {
+                return Err(format!("object bucket must be {configured}"));
+            }
+            (Some(configured), _) => configured,
+            (None, Some(requested)) => requested.to_string(),
+            (None, None) => self.evidence.bucket.clone(),
+        };
+        if bucket.is_empty() {
+            return Err("catalog storage is not configured".into());
+        }
+        Ok(bucket)
+    }
+
+    pub fn validate_catalog_object(&self, bucket: Option<&str>, key: &str) -> Result<(), String> {
+        self.resolve_catalog_bucket(bucket)?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("object key is required".into());
+        }
+        if key.starts_with('/')
+            || key
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            || key.chars().any(char::is_control)
+        {
+            return Err("object key is invalid".into());
+        }
+        if let Some(prefix) = self.catalog_prefix() {
+            if !key.starts_with(&prefix) {
+                return Err(format!("object key must start with {prefix}"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
         let mut config = if let Some(path) = path {
             if Path::new(path).exists() {
@@ -278,6 +336,14 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(config.index.max_upload_bytes);
+        config.index.catalog_bucket = env::var("ARS_CATALOG_S3_BUCKET")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or(config.index.catalog_bucket);
+        config.index.catalog_prefix = env::var("ARS_CATALOG_S3_PREFIX")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or(config.index.catalog_prefix);
 
         Ok(config)
     }
